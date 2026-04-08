@@ -1,0 +1,11 @@
+[package]
+name = "CetusShiftPatched"
+version = "0.0.1"
+edition = "2024.beta"
+
+[dependencies]
+
+[addresses]
+integer_mate = "0x1"
+cetus_clmm = "0x2"
+
