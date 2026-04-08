@@ -1,0 +1,31 @@
+[[packages]]
+label = "integer-mate"
+git = "https://github.com/CetusProtocol/integer-mate.git"
+rev = "1fc772f61355de6b2be43275f909f120812c4bdc"
+package_subdir = "."
+with_implicit_deps = false
+expected = "flagged"
+
+[[packages]]
+label = "cetus-clmm"
+git = "https://github.com/CetusProtocol/cetus-clmm-interface.git"
+rev = "74e98b69334ecc84fc419d10a59d3d4e1f832d32"
+package_subdir = "sui/cetus_clmm"
+with_implicit_deps = true
+expected = "flagged"
+
+[[packages]]
+label = "hello-world"
+git = "https://github.com/sui-foundation/sui-move-intro-course.git"
+rev = "9dd51f962d2ebe5682fbb54a8a74a7890f8d4f8e"
+package_subdir = "unit-one/example_projects/hello_world"
+with_implicit_deps = true
+expected = "clean"
+
+[[packages]]
+label = "witness"
+git = "https://github.com/sui-foundation/sui-move-intro-course.git"
+rev = "9dd51f962d2ebe5682fbb54a8a74a7890f8d4f8e"
+package_subdir = "unit-three/example_projects/witness"
+with_implicit_deps = true
+expected = "clean"
