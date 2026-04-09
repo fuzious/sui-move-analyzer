@@ -917,3 +917,43 @@ pub fn formula_tags_from_name(name: &str) -> BTreeSet<FormulaTag> {
     }
     tags
 }
+
+pub fn formula_tags_from_function(module_name: &str, fn_name: &str) -> BTreeSet<FormulaTag> {
+    let module = module_name.to_ascii_lowercase();
+    let func = fn_name.to_ascii_lowercase();
+    let mut tags = BTreeSet::new();
+
+    let is_clmm_module = module.contains("clmm")
+        || module.contains("integer_mate")
+        || module.contains("concentrated")
+        || module.contains("tick_math")
+        || module.contains("sqrt_price");
+
+    if func.contains("sqrt_price")
+        || func.contains("price_x")
+        || func.contains("price_y")
+        || (is_clmm_module && (func.starts_with("get_price") || func.starts_with("calc_price")))
+    {
+        tags.insert(FormulaTag::PriceLike);
+    }
+    if func.contains("liquidity")
+        || (is_clmm_module && func.starts_with("get_liquidity"))
+        || func.contains("delta_liquidity")
+    {
+        tags.insert(FormulaTag::LiquidityLike);
+    }
+    if func.contains("denominator")
+        || (func.contains("mul") && func.contains("div"))
+        || func.contains("full_math")
+        || func == "mul_div"
+        || func == "mul_div_round"
+        || func == "mul_shr"
+    {
+        tags.insert(FormulaTag::DenominatorLike);
+    }
+    tags
+}
+
+pub fn formula_tags_from_field(field_name: &str) -> BTreeSet<FormulaTag> {
+    formula_tags_from_name(field_name)
+}

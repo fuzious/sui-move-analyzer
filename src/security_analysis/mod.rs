@@ -3,6 +3,7 @@ pub mod domain;
 pub mod report;
 pub mod rules;
 pub mod sinks;
+pub mod smt;
 pub mod summaries;
 pub mod transfer;
 

@@ -3,15 +3,19 @@ use crate::security_analysis::{
     domain::{
         AbstractState, BitFacts, ConstraintOp, ExprNode, ExprOp, FormulaFactor, FormulaFacts,
         FormulaTag, Interval, ObligationKind, PathFact, ProofMode, RiskKind, RiskOrigin,
-        RoundingMode, SemanticRole, SymbolicTerm, ValueState, builtin_width, formula_tags_from_name,
-        integer_value, low_mask, stable_hash, type_builtin, type_interval, uint_max, width_mask,
+        RoundingMode, SemanticRole, SymbolicTerm, ValueState, builtin_width,
+        formula_tags_from_field, formula_tags_from_function, formula_tags_from_name,
+        integer_value, stable_hash, type_builtin, type_interval, uint_max, width_mask,
     },
     report::{SecurityFinding, SinkKind, collect_diagnostics, normalize_findings},
     rules::{
-        fake_checked_shift::guard_is_weaker_than_threshold, narrow_cast::cast_max,
+        self as rule_registry,
+        RuleCtx,
+        narrow_cast::cast_max,
         shift_truncation::no_truncation_threshold,
     },
     sinks::{classify_call_sink, sink_priority},
+    smt,
     summaries::{FunctionSummary, ReturnSummary},
     SecurityMathMode,
 };
@@ -871,7 +875,32 @@ impl<'a> FunctionAnalyzer<'a> {
             E::ErrorConstant { .. } => vec![ValueState::exact_uint(256, U256::zero())],
             E::Freeze(inner) | E::Dereference(inner) => self.eval_exp(inner, state),
             E::BorrowLocal(_, var) => vec![self.lookup_var(state, var)],
-            E::Borrow(_, inner, _, _) => self.eval_exp(inner, state),
+            E::Borrow(_, inner, field, _) => {
+                // ── Structural tagging from field name ───────────────────────
+                // e.g. `pool.sqrt_price_a` tags the result as PriceLike even
+                // when the receiving variable is named `val` or `p`.
+                let mut values = self.eval_exp(inner, state);
+                let field_tags = formula_tags_from_field(&field.to_string());
+                if !field_tags.is_empty() {
+                    for val in &mut values {
+                        match &mut val.formula_facts {
+                            Some(facts) => facts.merge_tags(field_tags.clone()),
+                            None => {
+                                val.formula_facts = Some(FormulaFacts {
+                                    tags: field_tags.clone(),
+                                    factors: vec![],
+                                    root_expr: None,
+                                    roles: BTreeSet::new(),
+                                    rounding_mode: RoundingMode::Exact,
+                                    rounding_trace: vec![],
+                                    rounding_conflict: false,
+                                });
+                            }
+                        }
+                    }
+                }
+                values
+            }
             E::UnaryExp(sp!(_, UnaryOp_::Not), inner) => {
                 let _ = self.eval_exp(inner, state);
                 vec![ValueState {
@@ -917,43 +946,18 @@ impl<'a> FunctionAnalyzer<'a> {
                     .unwrap_or_else(ValueState::top);
                 if let Some(dest_width) = builtin_width(&builtin.value) {
                     let max_value = cast_max(dest_width);
-                    if value.interval.upper.is_some_and(|upper| upper <= max_value) {
-                        value.interval = value
-                            .interval
-                            .intersect(Some(U256::zero()), Some(max_value));
-                    } else {
-                        let source_name = self.describe_exp(inner);
-                        let origin = RiskOrigin {
-                            key: format!(
-                                "{}:{}:{}",
-                                RiskKind::ReachableNarrowCast.rule_id(),
-                                exp.exp.loc.file_hash(),
-                                exp.exp.loc.start()
-                            ),
-                            kind: RiskKind::ReachableNarrowCast,
-                            loc: exp.exp.loc,
-                            source_param_index: self.single_parameter_dependency(&value),
-                            width: Some(dest_width),
-                            shift_amount: None,
-                            threshold: Some(max_value),
-                            title: "Reachable narrowing cast on value-bearing path".to_string(),
-                            expr_text: self.describe_exp(exp),
-                            failed_condition: format!("{source_name} <= {max_value}"),
-                            path_facts: self.path_fact_texts(state),
-                            source_interval: value.interval.describe(),
-                            source_name,
-                            helper_name: Some(self.info.key.name.to_string()),
-                            helper_like: false,
-                            guard_mismatch: false,
-                            obligation_kind: ObligationKind::None,
-                            proof_mode: ProofMode::Abstract,
-                            rounding_mode: None,
-                        };
+                    let ctx = self.rule_ctx(exp.exp.loc, state);
+                    if let Some(origin) = rule_registry::narrow_cast::check(
+                        &ctx,
+                        &value,
+                        &self.describe_exp(inner),
+                        dest_width,
+                    ) {
                         self.push_origin(&mut value, origin);
-                        value.interval = value
-                            .interval
-                            .intersect(Some(U256::zero()), Some(max_value));
                     }
+                    value.interval = value
+                        .interval
+                        .intersect(Some(U256::zero()), Some(max_value));
                     value.bit_facts = Some(
                         value
                             .bit_facts
@@ -1125,10 +1129,40 @@ impl<'a> FunctionAnalyzer<'a> {
                     &argument_values[1],
                     &call.arguments[1],
                     state,
+                    Some(&argument_values[0]),
+                    Some(&argument_values[1]),
                 ) {
                     self.push_origin(&mut value, origin);
                 }
             }
+            let module_str = format!(
+                "{}::{}",
+                call.module.value.address.to_string().to_ascii_lowercase(),
+                call.module.value.module.0.value.to_ascii_lowercase()
+            );
+            let structural_tags = formula_tags_from_function(&module_str, &call_name);
+            if !structural_tags.is_empty() {
+                match &mut value.formula_facts {
+                    Some(facts) => facts.merge_tags(structural_tags),
+                    None => {
+                        let _id = stable_hash(&[
+                            b"struct-tag",
+                            call.module.value.module.0.value.as_str().as_bytes(),
+                            call_name.as_bytes(),
+                        ]);
+                        value.formula_facts = Some(FormulaFacts {
+                            tags: structural_tags,
+                            factors: vec![],
+                            root_expr: None,
+                            roles: BTreeSet::new(),
+                            rounding_mode: RoundingMode::Exact,
+                            rounding_trace: vec![],
+                            rounding_conflict: false,
+                        });
+                    }
+                }
+            }
+
             if let Some(facts) = &mut value.formula_facts {
                 let lowered = call_name.to_ascii_lowercase();
                 if lowered.contains("ceil")
@@ -1239,9 +1273,10 @@ impl<'a> FunctionAnalyzer<'a> {
                         }
                     });
                 value.formula_facts = self.combine_div_formula(&lhs, &rhs, self.describe_exp(exp));
-                if let Some(origin) =
-                    self.make_weak_denominator_origin(exp, &lhs, lhs_exp, &rhs, rhs_exp, state)
-                {
+                if let Some(origin) = self.make_weak_denominator_origin(
+                    exp, &lhs, lhs_exp, &rhs, rhs_exp, state,
+                    Some(&lhs), Some(&rhs),
+                ) {
                     self.push_origin(&mut value, origin);
                 }
             }
@@ -1271,28 +1306,11 @@ impl<'a> FunctionAnalyzer<'a> {
                         bottom: false,
                     };
                     value.refine_with_bit_facts();
-                    if value.exact_value().is_none() {
-                        self.push_origin(
-                            &mut value,
-                            self.make_origin(
-                                RiskKind::SuspiciousBitwiseArithmetic,
-                                exp,
-                                &lhs,
-                                lhs_exp,
-                                state,
-                                Some(width),
-                                None,
-                                None,
-                                "Bitwise arithmetic result remains non-exact before downstream use"
-                                    .to_string(),
-                                "Suspicious bitwise result may influence downstream arithmetic"
-                                    .to_string(),
-                                false,
-                                ObligationKind::None,
-                                ProofMode::Abstract,
-                                None,
-                            ),
-                        );
+                    let ctx = self.rule_ctx(exp.exp.loc, state);
+                    if let Some(origin) = rule_registry::suspicious_bitwise::check(
+                        &ctx, &value, &self.describe_exp(exp),
+                    ) {
+                        self.push_origin(&mut value, origin);
                     }
                 }
                 value.formula_facts =
@@ -1308,28 +1326,11 @@ impl<'a> FunctionAnalyzer<'a> {
                         bottom: false,
                     };
                     value.refine_with_bit_facts();
-                    if value.exact_value().is_none() {
-                        self.push_origin(
-                            &mut value,
-                            self.make_origin(
-                                RiskKind::SuspiciousBitwiseArithmetic,
-                                exp,
-                                &lhs,
-                                lhs_exp,
-                                state,
-                                Some(width),
-                                None,
-                                None,
-                                "Bitwise arithmetic result remains non-exact before downstream use"
-                                    .to_string(),
-                                "Suspicious bitwise result may influence downstream arithmetic"
-                                    .to_string(),
-                                false,
-                                ObligationKind::None,
-                                ProofMode::Abstract,
-                                None,
-                            ),
-                        );
+                    let ctx = self.rule_ctx(exp.exp.loc, state);
+                    if let Some(origin) = rule_registry::suspicious_bitwise::check(
+                        &ctx, &value, &self.describe_exp(exp),
+                    ) {
+                        self.push_origin(&mut value, origin);
                     }
                 }
                 value.formula_facts =
@@ -1345,65 +1346,42 @@ impl<'a> FunctionAnalyzer<'a> {
                         bottom: false,
                     };
                     value.refine_with_bit_facts();
-                    if value.exact_value().is_none() {
-                        self.push_origin(
-                            &mut value,
-                            self.make_origin(
-                                RiskKind::SuspiciousBitwiseArithmetic,
-                                exp,
-                                &lhs,
-                                lhs_exp,
-                                state,
-                                Some(width),
-                                None,
-                                None,
-                                "Bitwise arithmetic result remains non-exact before downstream use"
-                                    .to_string(),
-                                "Suspicious bitwise result may influence downstream arithmetic"
-                                    .to_string(),
-                                false,
-                                ObligationKind::None,
-                                ProofMode::Abstract,
-                                None,
-                            ),
-                        );
+                    let ctx = self.rule_ctx(exp.exp.loc, state);
+                    if let Some(origin) = rule_registry::suspicious_bitwise::check(
+                        &ctx, &value, &self.describe_exp(exp),
+                    ) {
+                        self.push_origin(&mut value, origin);
                     }
                 }
                 value.formula_facts = None;
             }
             BinOp_::Shl => {
                 if let Some(width) = result_width {
-                    let shift_amount = rhs.exact_value().map(|value| value.unchecked_as_u8());
+                    let shift_amount = rhs.exact_value().map(|v| v.unchecked_as_u8());
                     if let Some(shift_amount) = shift_amount {
-                        if (shift_amount as u16) >= width {
-                            self.push_origin(
-                                &mut value,
-                                self.make_origin(
-                                    RiskKind::InvalidShiftCount,
-                                    exp,
-                                    &rhs,
-                                    rhs_exp,
-                                    state,
-                                    Some(width),
-                                    Some(shift_amount),
-                                    None,
-                                    format!("{shift_amount} < {width}"),
-                                    "Invalid shift count is reachable".to_string(),
-                                    false,
-                                    ObligationKind::None,
-                                    ProofMode::Abstract,
-                                    None,
-                                ),
-                            );
+                        let ctx = self.rule_ctx(exp.exp.loc, state);
+                        // ── Invalid shift count ──────────────────────────────
+                        if let Some(origin) = rule_registry::invalid_shift_count::check(
+                            &ctx, &rhs, width, shift_amount,
+                        ) {
+                            self.push_origin(&mut value, origin);
                             value.interval = Interval::top();
                             value.bit_facts = Some(BitFacts::unknown(width));
                         } else {
+                            // ── Shift truncation / fake-checked-shift ────────
                             let threshold = no_truncation_threshold(width, shift_amount);
                             let guard_upper_bound = self.strongest_upper_bound(lhs_exp, state);
-                            let has_guard = guard_upper_bound.is_some();
-                            let guard_mismatch =
-                                guard_is_weaker_than_threshold(guard_upper_bound, threshold);
-                            if lhs.interval.upper.is_some_and(|upper| upper <= threshold) {
+                            // Also ask SMT whether path constraints alone prove safety.
+                            let lhs_var = self.extract_var(lhs_exp);
+                            let var_facts: Vec<PathFact> = lhs_var
+                                .map(|v| smt::path_facts_for_var(state, v))
+                                .unwrap_or_default();
+                            if smt::shift::proven_safe(
+                                lhs.interval.upper,
+                                threshold,
+                                &var_facts,
+                            ) {
+                                // Provably safe — compute exact result.
                                 if let (Some(lo), Some(hi)) =
                                     (lhs.interval.lower, lhs.interval.upper)
                                 {
@@ -1418,44 +1396,37 @@ impl<'a> FunctionAnalyzer<'a> {
                                     .as_ref()
                                     .map(|facts| facts.shift_left(shift_amount, width));
                                 value.refine_with_bit_facts();
-                            } else {
-                                let kind = if has_guard && guard_mismatch {
-                                    RiskKind::FakeCheckedShift
-                                } else {
-                                    RiskKind::ReachableShiftTruncation
-                                };
-                                self.push_origin(
-                                    &mut value,
-                                    self.make_origin(
-                                        kind,
-                                        exp,
-                                        &lhs,
-                                        lhs_exp,
-                                        state,
-                                        Some(width),
-                                        Some(shift_amount),
-                                        Some(threshold),
-                                        format!(
-                                            "{} <= {threshold} (MAX_U{width} >> {shift_amount})",
-                                            self.describe_exp(lhs_exp)
-                                        ),
-                                        if has_guard && guard_mismatch {
-                                            "Unsound checked-shift helper is reachable".to_string()
-                                        } else {
-                                            "Reachable truncating left shift".to_string()
-                                        },
-                                        guard_mismatch,
-                                        ObligationKind::None,
-                                        ProofMode::Abstract,
-                                        None,
-                                    ),
-                                );
+                            } else if let Some(origin) = rule_registry::shift_truncation::check_shl(
+                                &ctx,
+                                &lhs,
+                                &self.describe_exp(lhs_exp),
+                                width,
+                                shift_amount,
+                                guard_upper_bound,
+                            ) {
+                                self.push_origin(&mut value, origin);
                                 value.interval = Interval {
                                     lower: Some(U256::zero()),
                                     upper: result_max,
                                     bottom: false,
                                 };
                                 value.bit_facts = Some(BitFacts::unknown(width));
+                            } else {
+                                // Safe via interval (check_shl returned None).
+                                if let (Some(lo), Some(hi)) =
+                                    (lhs.interval.lower, lhs.interval.upper)
+                                {
+                                    value.interval = Interval {
+                                        lower: lo.checked_shl(shift_amount as u32),
+                                        upper: hi.checked_shl(shift_amount as u32),
+                                        bottom: false,
+                                    };
+                                }
+                                value.bit_facts = lhs
+                                    .bit_facts
+                                    .as_ref()
+                                    .map(|facts| facts.shift_left(shift_amount, width));
+                                value.refine_with_bit_facts();
                             }
                         }
                     } else {
@@ -1471,31 +1442,17 @@ impl<'a> FunctionAnalyzer<'a> {
             }
             BinOp_::Shr => {
                 if let Some(width) = result_width {
-                    let shift_amount = rhs.exact_value().map(|value| value.unchecked_as_u8());
+                    let shift_amount = rhs.exact_value().map(|v| v.unchecked_as_u8());
                     if let Some(shift_amount) = shift_amount {
-                        if (shift_amount as u16) >= width {
-                            self.push_origin(
-                                &mut value,
-                                self.make_origin(
-                                    RiskKind::InvalidShiftCount,
-                                    exp,
-                                    &rhs,
-                                    rhs_exp,
-                                    state,
-                                    Some(width),
-                                    Some(shift_amount),
-                                    None,
-                                    format!("{shift_amount} < {width}"),
-                                    "Invalid shift count is reachable".to_string(),
-                                    false,
-                                    ObligationKind::None,
-                                    ProofMode::Abstract,
-                                    None,
-                                ),
-                            );
+                        let ctx = self.rule_ctx(exp.exp.loc, state);
+                        if let Some(origin) = rule_registry::invalid_shift_count::check(
+                            &ctx, &rhs, width, shift_amount,
+                        ) {
+                            self.push_origin(&mut value, origin);
                             value.interval = Interval::top();
                             value.bit_facts = Some(BitFacts::unknown(width));
                         } else {
+                            // Compute exact result.
                             if let (Some(lo), Some(hi)) = (lhs.interval.lower, lhs.interval.upper) {
                                 value.interval = Interval {
                                     lower: lo.checked_shr(shift_amount as u32),
@@ -1508,33 +1465,15 @@ impl<'a> FunctionAnalyzer<'a> {
                                 .as_ref()
                                 .map(|facts| facts.shift_right(shift_amount, width));
                             value.refine_with_bit_facts();
-                            let discarded_mask = low_mask(shift_amount) & width_mask(width);
-                            if discarded_mask != U256::zero()
-                                && lhs.may_have_non_zero_bits(discarded_mask)
-                            {
-                                self.push_origin(
-                                    &mut value,
-                                    self.make_origin(
-                                        RiskKind::ReachableLossyRightShift,
-                                        exp,
-                                        &lhs,
-                                        lhs_exp,
-                                        state,
-                                        Some(width),
-                                        Some(shift_amount),
-                                        None,
-                                        format!(
-                                            "({} & {}) == 0",
-                                            self.describe_exp(lhs_exp),
-                                            discarded_mask
-                                        ),
-                                        "Right shift may discard non-zero low bits".to_string(),
-                                        false,
-                                        ObligationKind::None,
-                                        ProofMode::Abstract,
-                                        Some(RoundingMode::RoundDown),
-                                    ),
-                                );
+                            // Check for lossy right-shift.
+                            if let Some(origin) = rule_registry::lossy_right_shift::check(
+                                &ctx,
+                                &lhs,
+                                &self.describe_exp(lhs_exp),
+                                width,
+                                shift_amount,
+                            ) {
+                                self.push_origin(&mut value, origin);
                             }
                         }
                     } else {
@@ -1948,150 +1887,21 @@ impl<'a> FunctionAnalyzer<'a> {
         denominator: &ValueState,
         denominator_exp: &H::Exp,
         state: &AbstractState,
+        lhs_factor: Option<&ValueState>,
+        rhs_factor: Option<&ValueState>,
     ) -> Option<RiskOrigin> {
-        let denom_facts = denominator.formula_facts.as_ref();
-        let mut factors = denom_facts
-            .map(|facts| facts.factors.clone())
-            .unwrap_or_default();
-        factors.sort_by_key(|factor| factor.id);
-        factors.dedup_by_key(|factor| factor.id);
-        if factors.is_empty() {
-            if let Some(root) = denom_facts.and_then(|facts| facts.root_expr.as_ref()) {
-                factors.push(FormulaFactor {
-                    id: root.id,
-                    name: root.debug.clone(),
-                    tags: BTreeSet::new(),
-                    roles: BTreeSet::from([SemanticRole::DivRhs]),
-                    strict_positive: denominator
-                        .interval
-                        .lower
-                        .is_some_and(|lower| lower > U256::zero()),
-                    source_locs: vec![denominator_exp.exp.loc],
-                    proof_mode: ProofMode::Abstract,
-                });
-            } else {
-                let expr_text = self.describe_exp(denominator_exp);
-                factors.push(FormulaFactor {
-                    id: stable_hash(&[
-                        b"synthetic-div-factor",
-                        expr_text.as_bytes(),
-                        self.info.key.name.to_string().as_bytes(),
-                    ]),
-                    name: expr_text,
-                    tags: BTreeSet::new(),
-                    roles: BTreeSet::from([SemanticRole::DivRhs]),
-                    strict_positive: denominator
-                        .interval
-                        .lower
-                        .is_some_and(|lower| lower > U256::zero()),
-                    source_locs: vec![denominator_exp.exp.loc],
-                    proof_mode: ProofMode::Heuristic,
-                });
-            }
-        }
-        let is_product = denom_facts
-            .and_then(|facts| facts.root_expr.as_ref())
-            .is_some_and(|root| root.op == ExprOp::Mul)
-            || factors.len() >= 2;
-        let all_factors_positive = factors.iter().all(|factor| factor.strict_positive);
-        let zero_reachable = if all_factors_positive {
-            false
-        } else {
-            denominator
-                .interval
-                .lower
-                .is_none_or(|lower| lower == U256::zero())
-        };
-        let require_factor_positivity =
-            is_product && self.invariant_mode_requires_independent_factor_proofs(numerator);
-        let violates_non_zero = zero_reachable;
-        let violates_factor_positivity = require_factor_positivity && !all_factors_positive;
-        if !violates_non_zero && !violates_factor_positivity {
-            return None;
-        }
-        let obligation_kind = if violates_non_zero {
-            ObligationKind::NonZeroDivisor
-        } else {
-            ObligationKind::IndependentFactorPositivity
-        };
-        let failed_condition = match obligation_kind {
-            ObligationKind::NonZeroDivisor => format!("{} != 0", self.describe_exp(denominator_exp)),
-            ObligationKind::IndependentFactorPositivity => factors
-                .iter()
-                .map(|factor| format!("{} > 0", self.factor_label(factor)))
-                .collect::<Vec<_>>()
-                .join(" && "),
-            _ => "denominator obligations hold".to_string(),
-        };
-        let title = match obligation_kind {
-            ObligationKind::NonZeroDivisor => {
-                "Denominator may be zero on a reachable value-bearing path"
-            }
-            ObligationKind::IndependentFactorPositivity => {
-                "Independent denominator factors are not all proven strictly positive"
-            }
-            _ => "Potential denominator obligation failure",
-        }
-        .to_string();
-        let proof_mode = self.obligation_proof_mode(denominator_exp, state, denom_facts.is_some());
-        Some(RiskOrigin {
-            key: format!(
-                "{}:{}:{}",
-                RiskKind::ReachableWeakDenominator.rule_id(),
-                exp.exp.loc.file_hash(),
-                exp.exp.loc.start()
-            ),
-            kind: RiskKind::ReachableWeakDenominator,
-            loc: exp.exp.loc,
-            source_param_index: self.single_parameter_dependency(denominator),
-            width: denominator.width(),
-            shift_amount: None,
-            threshold: if violates_non_zero {
-                Some(U256::zero())
-            } else {
-                None
-            },
-            title,
-            expr_text: self.describe_exp(exp),
-            failed_condition,
-            path_facts: self.path_fact_texts(state),
-            source_interval: denominator.interval.describe(),
-            source_name: self.describe_exp(denominator_exp),
-            helper_name: Some(self.info.key.name.to_string()),
-            helper_like: self.is_denominator_helper_context(),
-            guard_mismatch: false,
-            obligation_kind,
-            proof_mode,
-            rounding_mode: denom_facts.map(|facts| facts.rounding_mode),
-        })
-    }
-
-    fn factor_label(&self, factor: &FormulaFactor) -> String {
-        if !factor.name.is_empty() {
-            factor.name.clone()
-        } else {
-            format!("factor#{}", factor.id)
-        }
-    }
-
-    fn invariant_mode_requires_independent_factor_proofs(&self, numerator: &ValueState) -> bool {
-        matches!(self.math_mode, SecurityMathMode::Deep)
-            || numerator
-                .formula_facts
-                .as_ref()
-                .is_some_and(|facts| !facts.factors.is_empty() || facts.root_expr.is_some())
-    }
-
-    fn obligation_proof_mode(
-        &self,
-        _denominator_exp: &H::Exp,
-        _state: &AbstractState,
-        semantic_available: bool,
-    ) -> ProofMode {
-        if !semantic_available {
-            return ProofMode::Heuristic;
-        }
-        ProofMode::Abstract
+        let ctx = self.rule_ctx(exp.exp.loc, state);
+        rule_registry::weak_denominator::check(
+            &ctx,
+            numerator,
+            denominator,
+            denominator_exp.exp.loc,
+            &self.describe_exp(denominator_exp),
+            self.is_denominator_helper_context(),
+            self.math_mode,
+            lhs_factor,
+            rhs_factor,
+        )
     }
 
     fn is_denominator_helper_context(&self) -> bool {
@@ -2103,6 +1913,15 @@ impl<'a> FunctionAnalyzer<'a> {
             || lowered.contains("quotient")
             || lowered.contains("checked")
             || lowered.contains("mul_shr")
+    }
+
+    /// Build a `RuleCtx` for the current program point.
+    fn rule_ctx(&self, exp_loc: Loc, state: &AbstractState) -> RuleCtx<'_> {
+        RuleCtx {
+            exp_loc,
+            fn_name: self.info.key.name.0.value.as_str(),
+            path_facts: self.path_fact_texts(state),
+        }
     }
 
     fn describe_obligation(&self, obligation_kind: ObligationKind) -> &'static str {
@@ -2140,50 +1959,6 @@ impl<'a> FunctionAnalyzer<'a> {
         }
     }
 
-    fn make_origin(
-        &self,
-        kind: RiskKind,
-        exp: &H::Exp,
-        source_value: &ValueState,
-        source_exp: &H::Exp,
-        state: &AbstractState,
-        width: Option<u16>,
-        shift_amount: Option<u8>,
-        threshold: Option<U256>,
-        failed_condition: String,
-        title: String,
-        guard_mismatch: bool,
-        obligation_kind: ObligationKind,
-        proof_mode: ProofMode,
-        rounding_mode: Option<RoundingMode>,
-    ) -> RiskOrigin {
-        RiskOrigin {
-            key: format!(
-                "{}:{}:{}",
-                kind.rule_id(),
-                exp.exp.loc.file_hash(),
-                exp.exp.loc.start()
-            ),
-            kind,
-            loc: exp.exp.loc,
-            source_param_index: self.single_parameter_dependency(source_value),
-            width,
-            shift_amount,
-            threshold,
-            title,
-            expr_text: self.describe_exp(exp),
-            failed_condition,
-            path_facts: self.path_fact_texts(state),
-            source_interval: source_value.interval.describe(),
-            source_name: self.describe_exp(source_exp),
-            helper_name: Some(self.info.key.name.to_string()),
-            helper_like: false,
-            guard_mismatch,
-            obligation_kind,
-            proof_mode,
-            rounding_mode,
-        }
-    }
 
     fn push_origin(&self, value: &mut ValueState, origin: RiskOrigin) {
         if value
