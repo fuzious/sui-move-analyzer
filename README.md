@@ -21,6 +21,8 @@ The `integer-mate` library used by Cetus does this a lot. So do many concentrate
 
 I built a post-CFGIR security pass to close that gap. It applies the same kind of reasoning people already use for arithmetic, but on bitwise equivalents instead. The Cetus exploit is one example of this bug family. It is not the only one.
 
+I added lightweight SMT-style discharge helpers (`smt.rs`) for path/obligation checks (for example shift-safety and product-positivity proofs) to reduce false positives without changing the core static-analysis pipeline.
+
 ### Signals
 
 | Signal | Rule ID | Runtime | Existing static tools | This pass |
@@ -40,13 +42,21 @@ I built a post-CFGIR security pass to close that gap. It applies the same kind o
 
 Prerequisites: `git`, Rust toolchain (`cargo`). The script also requires the `sui` CLI to pre-fetch Sui framework dependencies for the real Cetus package; the vendored commands below do not.
 
-**With the `sui` CLI (runs against real on-chain code):**
+**Exploit-family replay (integer-mate revisions):**
 
 ```
 bash scripts/demo_cetus_exploit_family.sh
 ```
 
-Clones the real Cetus CLMM repo (commit `74e98b6`) and the real integer-mate repo at three pinned revisions (vulnerable → partial fix → fully fixed), runs the analyzer on each, and asserts the correct findings appear and disappear at each stage.
+Clones `integer-mate` and checks three pinned revisions (vulnerable -> partial fix -> fully fixed). The script now enforces exploit-specific assertions: vulnerable and partial revisions must contain `security/fake-checked-shift` in `math_u256.move`, while the fixed revision must be clean.
+
+**Real Cetus package check (requires `sui` CLI):**
+
+```
+bash scripts/verify_cetus_real_package.sh
+```
+
+Builds and analyzes Cetus CLMM (commit `74e98b6`) with dependency resolution enabled.
 
 **Without the `sui` CLI (vendored fixtures, no network needed):**
 
