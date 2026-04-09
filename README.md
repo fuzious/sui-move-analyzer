@@ -33,3 +33,12 @@ I built a post-CFGIR security pass to close that gap. It applies the same kind o
 | Invalid shift count | `security/invalid-shift-count` | aborts for `u8` to `u128`, silent on `u256` | missed | catches both, and the `u256` case has no other defense |
 | Narrowing cast after shift | `security/reachable-narrow-cast` | aborts at runtime | misses bitwise paths | catches it statically on shift and bitwise paths |
 | Weak denominator (product) | `security/reachable-weak-denominator` | aborts only if the denominator is exactly zero | flags simple zero denominators | catches product denominators where `assert!(product > 0)` exists but each factor is not independently proven to be greater than zero |
+
+---
+
+## Verification
+
+- `bash scripts/demo_cetus_exploit_family.sh` — **start here**: clones the real Cetus CLMM repo (commit `74e98b6`) and the real integer-mate repo at three historical revisions (vulnerable → partial fix → fully fixed), runs the analyzer on each, and asserts the right findings appear and disappear at each stage
+- `cargo test`  runs all vendored fixtures; every test maps to a specific claim with enforced negative cases
+- `cargo run --bin security_demo -- tests/security_analysis/real_cases/cetus_vulnerable`  flags `checked_shlw` at line 7 with `security/fake-checked-shift` (no network, fixture vendored)
+- `cargo run --bin security_demo -- tests/security_analysis/real_cases/cetus_patched`  prints no findings (confirms no false positive on the fix)
