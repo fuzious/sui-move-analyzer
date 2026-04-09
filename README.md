@@ -6,6 +6,8 @@
 
 ## What was built
 
+![Architecture](achitecture_bitwise.png)
+
 Move's compiler and runtime already protect against arithmetic bugs: `a + b` overflows → aborts, `a / 0` → aborts, a narrowing cast that doesn't fit → aborts. Existing static analyzers extend this further and flag precision loss, rounding errors, and weak divisors for arithmetic operations.
 
 But DeFi developers — especially in CLMM and fixed-point math codebases — routinely use bitwise ops *as* arithmetic because it's faster. `x << 64` is `x * 2^64`. `x >> 64` is `x / 2^64`. Masking with `x & 0xFFFF` is cheap range bounding. The `integer-mate` library that Cetus built on top of does this throughout, and so do most concentrated liquidity AMMs, lending rate calculators, and oracle scaling implementations on Sui. Neither the compiler nor any existing static analyzer applies overflow or precision reasoning to bitwise operations — they see bit manipulation and move on.
