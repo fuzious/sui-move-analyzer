@@ -38,7 +38,26 @@ I built a post-CFGIR security pass to close that gap. It applies the same kind o
 
 ## Verification
 
-- `bash scripts/demo_cetus_exploit_family.sh` — **start here**: clones the real Cetus CLMM repo (commit `74e98b6`) and the real integer-mate repo at three historical revisions (vulnerable → partial fix → fully fixed), runs the analyzer on each, and asserts the right findings appear and disappear at each stage
-- `cargo test`  runs all vendored fixtures; every test maps to a specific claim with enforced negative cases
-- `cargo run --bin security_demo -- tests/security_analysis/real_cases/cetus_vulnerable`  flags `checked_shlw` at line 7 with `security/fake-checked-shift` (no network, fixture vendored)
-- `cargo run --bin security_demo -- tests/security_analysis/real_cases/cetus_patched`  prints no findings (confirms no false positive on the fix)
+Prerequisites: `git`, Rust toolchain (`cargo`). The script also requires the `sui` CLI to pre-fetch Sui framework dependencies for the real Cetus package; the vendored commands below do not.
+
+**With the `sui` CLI (runs against real on-chain code):**
+
+```
+bash scripts/demo_cetus_exploit_family.sh
+```
+
+Clones the real Cetus CLMM repo (commit `74e98b6`) and the real integer-mate repo at three pinned revisions (vulnerable → partial fix → fully fixed), runs the analyzer on each, and asserts the correct findings appear and disappear at each stage.
+
+**Without the `sui` CLI (vendored fixtures, no network needed):**
+
+```
+cargo test --lib security_analysis
+```
+
+31 tests, all vendored. Each test name maps to a specific claim and includes enforced negative cases (patched versions must produce zero findings for their specific rule).
+
+```
+cargo run --bin security_demo -- tests/security_analysis/real_cases/cetus_vulnerable
+```
+
+Expected output includes `math_u256.move | 7 | ... | NonblockingError | security/fake-checked-shift` — the exact helper, line, and rule that caused the $223M loss.
