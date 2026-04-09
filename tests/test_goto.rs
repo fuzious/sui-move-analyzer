@@ -268,32 +268,40 @@ mod tests {
         };
 
         let actual_r = goto_definition::on_go_to_def_request(&mock_ctx, &request);
-        let target_fpath = PathBuf::from(
-            "/Users/edy/.move/https___github_com_MystenLabs_sui_git_mainnet/crates/sui-framework/packages/move-stdlib/sources/vector.move",
-        );
-        let expect_r = Response::new_ok(
-            "go_to_def_request_003".to_string().into(),
-            json!([{
-                "range":{
-                    "end":{
-                        "character":24,
-                        "line":37
-                    },
-                    "start":{
-                        "character":18,
-                        "line":37
-                    }
-                },
-                "uri": ("file://".to_string() + target_fpath.to_str().unwrap()).replace('\\', "/")
-            }]),
-        );
         std::thread::sleep(Duration::new(1, 0));
         eprintln!("\n------------------------------\n");
         eprintln!("actual_r = {:?}", actual_r);
         eprintln!("\n");
-        eprintln!("expect_r = {:?}", expect_r);
+        eprintln!("expect_r = move-stdlib vector::borrow_mut definition");
         eprintln!("\n------------------------------\n");
-        assert_eq!(actual_r.result, expect_r.result);
+        let actual_result = actual_r
+            .result
+            .expect("goto definition should return a result payload");
+        let locations = actual_result
+            .as_array()
+            .expect("goto definition result should be an array");
+        assert_eq!(
+            locations.len(),
+            1,
+            "expected exactly one definition location, got {locations:?}"
+        );
+        let location = &locations[0];
+        assert_eq!(
+            location["range"],
+            json!({
+                "end": {"character": 24, "line": 37},
+                "start": {"character": 18, "line": 37}
+            })
+        );
+        let uri = location["uri"]
+            .as_str()
+            .expect("definition location should include uri");
+        assert!(
+            uri.ends_with(
+                "/crates/sui-framework/packages/move-stdlib/sources/vector.move"
+            ),
+            "expected move-stdlib vector.move target, got {uri}"
+        );
     }
 
     #[test]

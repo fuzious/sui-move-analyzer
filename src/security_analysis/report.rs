@@ -45,11 +45,17 @@ impl SecurityFinding {
             RiskKind::ReachableNarrowCast => (3, "reachable narrowing cast"),
             RiskKind::InvalidShiftCount => (4, "invalid shift count"),
             RiskKind::ReachableLossyRightShift => (5, "reachable lossy right shift"),
-            RiskKind::DynamicU256Shift => (6, "dynamic u256 shift"),
-            RiskKind::SuspiciousBitwiseArithmetic => (7, "suspicious bitwise arithmetic"),
-            RiskKind::ReachableWeakDenominator => (8, "reachable weak denominator"),
+            RiskKind::SuspiciousBitwiseArithmetic => (6, "suspicious bitwise arithmetic"),
+            RiskKind::ReachableWeakDenominator => (7, "reachable weak denominator"),
+            RiskKind::ReachableRoundingMismatch => (8, "reachable rounding mismatch"),
         };
-        let diag_info = custom(SECURITY_PREFIX, self.severity, SECURITY_CATEGORY, code, text);
+        let diag_info = custom(
+            SECURITY_PREFIX,
+            self.severity,
+            SECURITY_CATEGORY,
+            code,
+            text,
+        );
         let mut diag = diag!(diag_info, (self.loc, self.title.clone()));
         if let Some(sink_loc) = self.sink_loc {
             diag.add_secondary_label((sink_loc, "value reaches a meaningful downstream sink"));
@@ -87,14 +93,17 @@ fn sink_kind_rank(kind: &SinkKind) -> u8 {
     }
 }
 
-pub fn normalize_findings(findings: impl IntoIterator<Item = SecurityFinding>) -> Vec<SecurityFinding> {
+pub fn normalize_findings(
+    findings: impl IntoIterator<Item = SecurityFinding>,
+) -> Vec<SecurityFinding> {
     let mut best_by_key = std::collections::BTreeMap::<String, SecurityFinding>::new();
     for finding in findings {
         match best_by_key.get(&finding.key) {
             Some(existing)
                 if severity_rank(existing.severity) > severity_rank(finding.severity)
                     || (severity_rank(existing.severity) == severity_rank(finding.severity)
-                        && sink_kind_rank(&existing.sink_kind) >= sink_kind_rank(&finding.sink_kind)) => {}
+                        && sink_kind_rank(&existing.sink_kind)
+                            >= sink_kind_rank(&finding.sink_kind)) => {}
             _ => {
                 best_by_key.insert(finding.key.clone(), finding);
             }

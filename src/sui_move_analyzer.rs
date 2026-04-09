@@ -539,9 +539,8 @@ fn get_package_compile_diagnostics(
     let mut diagnostics = None;
     build_plan.compile_with_driver_and_deps(dependencies, &mut std::io::sink(), |compiler| {
         let compiler = compiler.set_ide_mode();
-        let (files, compilation_result) = compiler
-            .set_files_to_compile(None)
-            .run::<PASS_PARSER>()?;
+        let (files, compilation_result) =
+            compiler.set_files_to_compile(None).run::<PASS_PARSER>()?;
 
         let compiler = match compilation_result {
             std::result::Result::Ok(v) => v,
@@ -583,7 +582,9 @@ fn get_package_compile_diagnostics(
         };
         let (compiler, cfgir_program) = compiler.into_ast();
         let mut final_diags = compiler.compilation_env().take_final_diags();
-        final_diags.extend(crate::security_analysis::analyze_cfgir_program(&cfgir_program));
+        final_diags.extend(crate::security_analysis::analyze_cfgir_program(
+            &cfgir_program,
+        ));
         let failure = false;
         diagnostics = Some((final_diags, failure));
         eprintln!("compiled to CFGIR");

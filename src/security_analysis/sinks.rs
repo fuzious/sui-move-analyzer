@@ -1,59 +1,87 @@
 use crate::security_analysis::report::SinkKind;
+use move_compiler::{hlir::ast as H, sui_mode::SUI_ADDR_VALUE};
 
-const FIELD_KEYWORDS: &[&str] = &[
-    "amount",
-    "liquidity",
-    "reserve",
-    "fee",
-    "price",
-    "sqrt_price",
-    "share",
-    "mint",
-    "burn",
-    "debt",
-    "collateral",
-    "supply",
-];
-
-const CALL_KEYWORDS: &[&str] = &[
-    "transfer",
-    "mint",
-    "burn",
-    "swap",
-    "add_liquidity",
-    "remove_liquidity",
-    "redeem",
-];
-
-pub fn looks_like_helper(name: &str) -> bool {
-    let lowered = name.to_ascii_lowercase();
-    ["checked_shl", "checked_shlw", "safe_shl", "safe_shlw", "shift", "shl", "scale"]
-        .iter()
-        .any(|needle| lowered.contains(needle))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticCallSink {
+    /// Known transfer/movement APIs in the Sui framework.
+    KnownAssetMovementApi,
+    /// Call escapes the currently analyzed graph (out-of-scope or unresolved callee).
+    ExternalBoundary,
 }
 
-pub fn looks_like_financial_name(name: &str) -> bool {
-    let lowered = name.to_ascii_lowercase();
-    FIELD_KEYWORDS
-        .iter()
-        .any(|needle| lowered.contains(needle))
+impl SemanticCallSink {
+    pub fn is_critical(self) -> bool {
+        matches!(self, Self::KnownAssetMovementApi)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::KnownAssetMovementApi => "known-asset-movement-api",
+            Self::ExternalBoundary => "external-boundary-call",
+        }
+    }
 }
 
-pub fn looks_like_sink_call(name: &str) -> bool {
-    let lowered = name.to_ascii_lowercase();
-    CALL_KEYWORDS
-        .iter()
-        .any(|needle| lowered.contains(needle))
+pub fn classify_call_sink(call: &H::ModuleCall, callee_known: bool) -> Option<SemanticCallSink> {
+    if is_known_asset_movement_api(call) {
+        return Some(SemanticCallSink::KnownAssetMovementApi);
+    }
+    if !callee_known {
+        return Some(SemanticCallSink::ExternalBoundary);
+    }
+    None
 }
 
-pub fn sink_priority(kind: &SinkKind, financial_name: bool) -> u8 {
-    match (kind, financial_name) {
-        (SinkKind::CallArgument, true) => 3,
-        (SinkKind::FieldWrite, true) => 3,
-        (SinkKind::PublicReturn, true) => 3,
-        (SinkKind::CallArgument, false) => 2,
-        (SinkKind::FieldWrite, false) => 2,
-        (SinkKind::PublicReturn, false) => 1,
-        (SinkKind::ArithmeticUse, _) => 1,
+fn is_known_asset_movement_api(call: &H::ModuleCall) -> bool {
+    // These are framework-level movement/ownership APIs where passing a risky value is meaningful.
+    const TRANSFER_FUNS: &[&str] = &[
+        "transfer",
+        "public_transfer",
+        "share_object",
+        "public_share_object",
+        "freeze_object",
+        "public_freeze_object",
+        "receive",
+        "public_receive",
+    ];
+    if TRANSFER_FUNS
+        .iter()
+        .any(|fun| call.is(&SUI_ADDR_VALUE, "transfer", *fun))
+    {
+        return true;
+    }
+
+    // Coin operations that consume/produce value and frequently use amount-bearing inputs.
+    const COIN_FUNS: &[&str] = &[
+        "transfer",
+        "split",
+        "split_and_transfer",
+        "take",
+        "put",
+        "join",
+    ];
+    COIN_FUNS
+        .iter()
+        .any(|fun| call.is(&SUI_ADDR_VALUE, "coin", *fun))
+}
+
+pub fn sink_priority(kind: &SinkKind, critical_surface: bool) -> u8 {
+    match kind {
+        SinkKind::CallArgument => {
+            if critical_surface {
+                3
+            } else {
+                2
+            }
+        }
+        SinkKind::FieldWrite => 3,
+        SinkKind::PublicReturn => {
+            if critical_surface {
+                3
+            } else {
+                1
+            }
+        }
+        SinkKind::ArithmeticUse => 1,
     }
 }

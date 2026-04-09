@@ -1,18 +1,19 @@
 use crate::security_analysis::{
     cfg::build_cfg,
     domain::{
-        AbstractState, BitFacts, ConstraintOp, FormulaFacts, FormulaTag, Interval, PathFact,
-        RiskKind, RiskOrigin, SymbolicTerm, ValueState, builtin_width, formula_tags_from_name,
-        integer_value, low_mask, type_builtin, type_interval, uint_max, width_mask,
+        AbstractState, BitFacts, ConstraintOp, ExprNode, ExprOp, FormulaFactor, FormulaFacts,
+        FormulaTag, Interval, ObligationKind, PathFact, ProofMode, RiskKind, RiskOrigin,
+        RoundingMode, SemanticRole, SymbolicTerm, ValueState, builtin_width, formula_tags_from_name,
+        integer_value, low_mask, stable_hash, type_builtin, type_interval, uint_max, width_mask,
     },
     report::{SecurityFinding, SinkKind, collect_diagnostics, normalize_findings},
     rules::{
-        fake_checked_shift::guard_is_weaker_than_threshold,
-        narrow_cast::cast_max,
+        fake_checked_shift::guard_is_weaker_than_threshold, narrow_cast::cast_max,
         shift_truncation::no_truncation_threshold,
     },
-    sinks::{looks_like_financial_name, looks_like_helper, looks_like_sink_call, sink_priority},
+    sinks::{classify_call_sink, sink_priority},
     summaries::{FunctionSummary, ReturnSummary},
+    SecurityMathMode,
 };
 use move_compiler::{
     cfgir::{ast as G, cfg::CFG},
@@ -20,10 +21,14 @@ use move_compiler::{
     expansion::ast::ModuleIdent,
     hlir::ast as H,
     parser::ast::{BinOp_, FunctionName, UnaryOp_},
+    shared::files::MappedFiles,
 };
 use move_core_types::u256::U256;
 use move_ir_types::location::Loc;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FunctionKey {
@@ -67,29 +72,51 @@ enum BitwiseOp {
 
 pub struct ProgramAnalyzer<'a> {
     functions: BTreeMap<FunctionKey, FunctionInfo<'a>>,
+    math_mode: SecurityMathMode,
+    smt_timeout_ms: u64,
 }
 
 impl<'a> ProgramAnalyzer<'a> {
-    pub fn new(program: &'a G::Program) -> Self {
+    pub fn new(
+        program: &'a G::Program,
+        mapped_files: Option<&MappedFiles>,
+        allowed_roots: Option<&[PathBuf]>,
+        root_roots: Option<&[PathBuf]>,
+        math_mode: SecurityMathMode,
+        smt_timeout_ms: u64,
+    ) -> Self {
         let mut functions = BTreeMap::new();
+        let mut root_seed_keys = BTreeSet::new();
         for (module, module_def) in program.modules.key_cloned_iter() {
             for (function_name, function) in module_def.functions.key_cloned_iter() {
-                functions.insert(
-                    FunctionKey {
-                        module,
-                        name: function_name,
-                    },
-                    FunctionInfo {
-                        key: FunctionKey {
-                            module,
-                            name: function_name,
-                        },
-                        function,
-                    },
-                );
+                let source_path = mapped_files
+                    .map(|files| normalize_path(files.file_path(&function.loc.file_hash())));
+                if let (Some(source_path), Some(allowed_roots)) = (&source_path, allowed_roots) {
+                    if !path_in_scope(source_path, allowed_roots) {
+                        continue;
+                    }
+                }
+                let key = FunctionKey {
+                    module,
+                    name: function_name,
+                };
+                if let (Some(source_path), Some(root_roots)) = (&source_path, root_roots)
+                    && path_in_scope(source_path, root_roots)
+                {
+                    root_seed_keys.insert(key.clone());
+                }
+                functions.insert(key.clone(), FunctionInfo { key, function });
             }
         }
-        Self { functions }
+        if !root_seed_keys.is_empty() {
+            let reachable = reachable_functions(&functions, &root_seed_keys);
+            functions.retain(|key, _| reachable.contains(key));
+        }
+        Self {
+            functions,
+            math_mode,
+            smt_timeout_ms,
+        }
     }
 
     pub fn run(&self) -> Diagnostics {
@@ -100,7 +127,8 @@ impl<'a> ProgramAnalyzer<'a> {
         let summaries = self.compute_summaries();
         let mut findings = vec![];
         for info in self.functions.values() {
-            let mut analyzer = FunctionAnalyzer::new(info.clone(), &summaries);
+            let mut analyzer =
+                FunctionAnalyzer::new(info.clone(), &summaries, self.math_mode, self.smt_timeout_ms);
             let outcome = analyzer.analyze(AnalysisMode::Findings);
             findings.extend(outcome.findings);
         }
@@ -118,7 +146,8 @@ impl<'a> ProgramAnalyzer<'a> {
             let mut changed = false;
             let mut next = summaries.clone();
             for (key, info) in &self.functions {
-                let mut analyzer = FunctionAnalyzer::new(info.clone(), &summaries);
+                let mut analyzer =
+                    FunctionAnalyzer::new(info.clone(), &summaries, self.math_mode, self.smt_timeout_ms);
                 let outcome = analyzer.analyze(AnalysisMode::Summary);
                 let summary = FunctionSummary {
                     returns: outcome
@@ -144,18 +173,124 @@ impl<'a> ProgramAnalyzer<'a> {
     }
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_in_scope(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| path.starts_with(root))
+}
+
+fn reachable_functions<'a>(
+    functions: &BTreeMap<FunctionKey, FunctionInfo<'a>>,
+    seeds: &BTreeSet<FunctionKey>,
+) -> BTreeSet<FunctionKey> {
+    let mut reachable = BTreeSet::new();
+    let mut worklist = VecDeque::from_iter(seeds.iter().cloned());
+    while let Some(current) = worklist.pop_front() {
+        if !reachable.insert(current.clone()) {
+            continue;
+        }
+        let Some(info) = functions.get(&current) else {
+            continue;
+        };
+        for callee in called_functions(info.function) {
+            if functions.contains_key(&callee) && !reachable.contains(&callee) {
+                worklist.push_back(callee);
+            }
+        }
+    }
+    reachable
+}
+
+fn called_functions(function: &G::Function) -> BTreeSet<FunctionKey> {
+    let mut calls = BTreeSet::new();
+    let G::FunctionBody_::Defined { blocks, .. } = &function.body.value else {
+        return calls;
+    };
+    for block in blocks.values() {
+        for command in block {
+            collect_calls_from_command(command, &mut calls);
+        }
+    }
+    calls
+}
+
+fn collect_calls_from_command(command: &H::Command, calls: &mut BTreeSet<FunctionKey>) {
+    use H::Command_ as C;
+    match &command.value {
+        C::Assign(_, _, exp) => collect_calls_from_exp(exp, calls),
+        C::Mutate(target, value) => {
+            collect_calls_from_exp(target, calls);
+            collect_calls_from_exp(value, calls);
+        }
+        C::Abort(_, exp) => collect_calls_from_exp(exp, calls),
+        C::Return { exp, .. } => collect_calls_from_exp(exp, calls),
+        C::IgnoreAndPop { exp, .. } => collect_calls_from_exp(exp, calls),
+        C::Jump { .. } | C::Break(_) | C::Continue(_) => {}
+        C::JumpIf { cond, .. } => collect_calls_from_exp(cond, calls),
+        C::VariantSwitch { subject, .. } => collect_calls_from_exp(subject, calls),
+    }
+}
+
+fn collect_calls_from_exp(exp: &H::Exp, calls: &mut BTreeSet<FunctionKey>) {
+    use H::UnannotatedExp_ as E;
+    match &exp.exp.value {
+        E::ModuleCall(call) => {
+            calls.insert(FunctionKey {
+                module: call.module,
+                name: call.name,
+            });
+            for argument in &call.arguments {
+                collect_calls_from_exp(argument, calls);
+            }
+        }
+        E::Freeze(inner) | E::Dereference(inner) | E::UnaryExp(_, inner) | E::Cast(inner, _) => {
+            collect_calls_from_exp(inner, calls)
+        }
+        E::BinopExp(lhs, _, rhs) => {
+            collect_calls_from_exp(lhs, calls);
+            collect_calls_from_exp(rhs, calls);
+        }
+        E::Pack(_, _, fields) | E::PackVariant(_, _, _, fields) => {
+            for (_, _, value) in fields {
+                collect_calls_from_exp(value, calls);
+            }
+        }
+        E::Multiple(values) | E::Vector(_, _, _, values) => {
+            for value in values {
+                collect_calls_from_exp(value, calls);
+            }
+        }
+        E::Borrow(_, inner, _, _) => collect_calls_from_exp(inner, calls),
+        E::Unit { .. }
+        | E::Value(_)
+        | E::Move { .. }
+        | E::Copy { .. }
+        | E::Constant(_)
+        | E::ErrorConstant { .. }
+        | E::BorrowLocal(_, _)
+        | E::Unreachable
+        | E::UnresolvedError => {}
+    }
+}
+
 struct FunctionAnalyzer<'a> {
     info: FunctionInfo<'a>,
     summaries: &'a BTreeMap<FunctionKey, FunctionSummary>,
     local_types: BTreeMap<H::Var, H::Type>,
     current_outcome: AnalysisOutcome,
     mode: AnalysisMode,
+    math_mode: SecurityMathMode,
+    _smt_timeout_ms: u64,
 }
 
 impl<'a> FunctionAnalyzer<'a> {
     fn new(
         info: FunctionInfo<'a>,
         summaries: &'a BTreeMap<FunctionKey, FunctionSummary>,
+        math_mode: SecurityMathMode,
+        smt_timeout_ms: u64,
     ) -> Self {
         let mut local_types = BTreeMap::new();
         for (_, var, single_ty) in &info.function.signature.parameters {
@@ -172,6 +307,8 @@ impl<'a> FunctionAnalyzer<'a> {
             local_types,
             current_outcome: AnalysisOutcome::new(),
             mode: AnalysisMode::Summary,
+            math_mode,
+            _smt_timeout_ms: smt_timeout_ms,
         }
     }
 
@@ -260,20 +397,25 @@ impl<'a> FunctionAnalyzer<'a> {
             C::Mutate(target, value) => {
                 let rhs_values = self.eval_exp(value, state);
                 let rhs = rhs_values.first().cloned().unwrap_or_else(ValueState::top);
-                if let Some((field_loc, field_name)) = self.borrow_field_name(target)
-                    && !rhs.risky_origins.is_empty()
-                    && looks_like_financial_name(&field_name)
-                {
-                    for origin in rhs.risky_origins {
+                if let Some((field_loc, field_name)) = self.borrow_field_name(target) {
+                    for origin in &rhs.risky_origins {
                         self.emit_sink(
-                            &origin,
+                            origin,
                             field_loc,
                             SinkKind::FieldWrite,
                             true,
                             state,
-                            Some(self.describe_exp(target)),
+                            Some(field_name.clone()),
                         );
                     }
+                    self.emit_rounding_mismatch_sink(
+                        &rhs,
+                        field_loc,
+                        SinkKind::FieldWrite,
+                        true,
+                        state,
+                        Some(field_name),
+                    );
                 }
                 let _ = self.eval_exp(target, state);
             }
@@ -281,22 +423,30 @@ impl<'a> FunctionAnalyzer<'a> {
                 let values = self.eval_exp(exp, state);
                 self.record_returns(&values);
                 if self.is_publicish() {
-                    let function_financial = looks_like_financial_name(&self.info.key.name.to_string());
+                    let critical_api_surface = self.is_value_api_surface();
                     for value in values {
-                        for origin in value.risky_origins {
+                        let sink_detail = Some(format!(
+                            "returned from {}::{}",
+                            self.info.key.module, self.info.key.name
+                        ));
+                        for origin in &value.risky_origins {
                             self.emit_sink(
-                                &origin,
+                                origin,
                                 command.loc,
                                 SinkKind::PublicReturn,
-                                function_financial,
+                                critical_api_surface,
                                 state,
-                                Some(format!(
-                                    "returned from {}::{}",
-                                    self.info.key.module,
-                                    self.info.key.name
-                                )),
+                                sink_detail.clone(),
                             );
                         }
+                        self.emit_rounding_mismatch_sink(
+                            &value,
+                            command.loc,
+                            SinkKind::PublicReturn,
+                            critical_api_surface,
+                            state,
+                            sink_detail,
+                        );
                     }
                 }
             }
@@ -332,10 +482,7 @@ impl<'a> FunctionAnalyzer<'a> {
         blocks: &G::BasicBlocks,
     ) -> AbstractState {
         let mut next = state.clone();
-        let Some(command) = blocks
-            .get(&predecessor)
-            .and_then(|block| block.back())
-        else {
+        let Some(command) = blocks.get(&predecessor).and_then(|block| block.back()) else {
             return next;
         };
         let H::Command_::JumpIf {
@@ -380,8 +527,13 @@ impl<'a> FunctionAnalyzer<'a> {
             }
             H::UnannotatedExp_::BinopExp(lhs, op, rhs) => match op.value {
                 BinOp_::And if truthy => {
-                    let mut constraints = self.collect_constraints(lhs, true, state).unwrap_or_default();
-                    constraints.extend(self.collect_constraints(rhs, true, state).unwrap_or_default());
+                    let mut constraints = self
+                        .collect_constraints(lhs, true, state)
+                        .unwrap_or_default();
+                    constraints.extend(
+                        self.collect_constraints(rhs, true, state)
+                            .unwrap_or_default(),
+                    );
                     Some(constraints)
                 }
                 BinOp_::And if !truthy => self.merge_disjunctive_constraints(
@@ -393,13 +545,19 @@ impl<'a> FunctionAnalyzer<'a> {
                     self.collect_constraints(rhs, true, state)?,
                 ),
                 BinOp_::Or if !truthy => {
-                    let mut constraints = self.collect_constraints(lhs, false, state).unwrap_or_default();
-                    constraints.extend(self.collect_constraints(rhs, false, state).unwrap_or_default());
+                    let mut constraints = self
+                        .collect_constraints(lhs, false, state)
+                        .unwrap_or_default();
+                    constraints.extend(
+                        self.collect_constraints(rhs, false, state)
+                            .unwrap_or_default(),
+                    );
                     Some(constraints)
                 }
-                BinOp_::Lt | BinOp_::Le | BinOp_::Gt | BinOp_::Ge | BinOp_::Eq | BinOp_::Neq => self
-                    .comparison_constraint(lhs, op.value, rhs, truthy, state)
-                    .map(|constraint| vec![constraint]),
+                BinOp_::Lt | BinOp_::Le | BinOp_::Gt | BinOp_::Ge | BinOp_::Eq | BinOp_::Neq => {
+                    self.comparison_constraint(lhs, op.value, rhs, truthy, state)
+                        .map(|constraint| vec![constraint])
+                }
                 _ => None,
             },
             _ => None,
@@ -443,13 +601,19 @@ impl<'a> FunctionAnalyzer<'a> {
             )]);
         }
 
-        if let Some(merged) = self.merge_bounded_with_one_sided(left_var, &left_interval, &right_interval) {
+        if let Some(merged) =
+            self.merge_bounded_with_one_sided(left_var, &left_interval, &right_interval)
+        {
             return Some(vec![merged]);
         }
-        if let Some(merged) = self.merge_bounded_with_one_sided(left_var, &right_interval, &left_interval) {
+        if let Some(merged) =
+            self.merge_bounded_with_one_sided(left_var, &right_interval, &left_interval)
+        {
             return Some(vec![merged]);
         }
-        if let Some(merged) = self.merge_overlapping_bounded(left_var, &left_interval, &right_interval) {
+        if let Some(merged) =
+            self.merge_overlapping_bounded(left_var, &left_interval, &right_interval)
+        {
             return Some(vec![merged]);
         }
 
@@ -614,7 +778,12 @@ impl<'a> FunctionAnalyzer<'a> {
                 ConstraintOp::Ne => ConstraintOp::Eq,
             };
         }
-        Some((var, op.clone(), bound, format!("{} {} {}", var.value(), op, bound)))
+        Some((
+            var,
+            op.clone(),
+            bound,
+            format!("{} {} {}", var.value(), op, bound),
+        ))
     }
 
     fn apply_constraint(
@@ -638,12 +807,39 @@ impl<'a> FunctionAnalyzer<'a> {
             ConstraintOp::Gt => value.interval.intersect(Some(bound + U256::one()), None),
             ConstraintOp::Ge => value.interval.intersect(Some(bound), None),
             ConstraintOp::Eq => value.interval.intersect(Some(bound), Some(bound)),
-            ConstraintOp::Ne => value.interval.clone(),
+            ConstraintOp::Ne => {
+                let next = value.interval.clone();
+                if next.bottom {
+                    Interval::bottom()
+                } else if next.is_singleton().is_some_and(|single| single == bound) {
+                    Interval::bottom()
+                } else if bound == U256::zero() {
+                    // Unsigned Move integers are always >= 0, so `x != 0` implies `x >= 1`.
+                    next.intersect(Some(U256::one()), None)
+                } else if next.lower == Some(bound) {
+                    if let Some(next_lower) = bound.checked_add(U256::one()) {
+                        next.intersect(Some(next_lower), None)
+                    } else {
+                        Interval::bottom()
+                    }
+                } else if next.upper == Some(bound) {
+                    if bound == U256::zero() {
+                        Interval::bottom()
+                    } else {
+                        next.intersect(None, Some(bound - U256::one()))
+                    }
+                } else {
+                    next
+                }
+            }
         };
         if value.interval.bottom {
             state.unreachable = true;
         } else {
-            let strict_positive = value.interval.lower.is_some_and(|lower| lower > U256::zero());
+            let strict_positive = value
+                .interval
+                .lower
+                .is_some_and(|lower| lower > U256::zero());
             if let Some(facts) = &mut value.formula_facts {
                 let var_name = var.value().to_string();
                 for factor in &mut facts.factors {
@@ -693,7 +889,12 @@ impl<'a> FunctionAnalyzer<'a> {
             }
             E::Multiple(values) => values
                 .iter()
-                .map(|value| self.eval_exp(value, state).into_iter().next().unwrap_or_else(ValueState::top))
+                .map(|value| {
+                    self.eval_exp(value, state)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(ValueState::top)
+                })
                 .collect(),
             E::Vector(_, _, _, values) => {
                 for value in values {
@@ -717,7 +918,9 @@ impl<'a> FunctionAnalyzer<'a> {
                 if let Some(dest_width) = builtin_width(&builtin.value) {
                     let max_value = cast_max(dest_width);
                     if value.interval.upper.is_some_and(|upper| upper <= max_value) {
-                        value.interval = value.interval.intersect(Some(U256::zero()), Some(max_value));
+                        value.interval = value
+                            .interval
+                            .intersect(Some(U256::zero()), Some(max_value));
                     } else {
                         let source_name = self.describe_exp(inner);
                         let origin = RiskOrigin {
@@ -740,16 +943,21 @@ impl<'a> FunctionAnalyzer<'a> {
                             source_interval: value.interval.describe(),
                             source_name,
                             helper_name: Some(self.info.key.name.to_string()),
-                            helper_like: looks_like_helper(&self.info.key.name.to_string()),
+                            helper_like: false,
                             guard_mismatch: false,
+                            obligation_kind: ObligationKind::None,
+                            proof_mode: ProofMode::Abstract,
+                            rounding_mode: None,
                         };
                         self.push_origin(&mut value, origin);
-                        value.interval = value.interval.intersect(Some(U256::zero()), Some(max_value));
+                        value.interval = value
+                            .interval
+                            .intersect(Some(U256::zero()), Some(max_value));
                     }
                     value.bit_facts = Some(
                         value
                             .bit_facts
-                            .unwrap_or_else(|| BitFacts::unknown(dest_width))
+                            .unwrap_or_else(|| BitFacts::unknown(dest_width)),
                     );
                     if let Some(facts) = &mut value.bit_facts {
                         facts.width = dest_width;
@@ -759,7 +967,8 @@ impl<'a> FunctionAnalyzer<'a> {
                     }
                     value.refine_with_bit_facts();
                 }
-                value.risky_origins
+                value
+                    .risky_origins
                     .retain(|origin| origin.kind != RiskKind::SuspiciousBitwiseArithmetic);
                 self.emit_arithmetic_use(
                     &value.risky_origins,
@@ -804,12 +1013,37 @@ impl<'a> FunctionAnalyzer<'a> {
             .collect();
 
         let call_name = call.name.to_string();
-        if looks_like_sink_call(&call_name) {
-            let financial = looks_like_financial_name(&call_name);
+        let callee_key = FunctionKey {
+            module: call.module,
+            name: call.name,
+        };
+        let callee_known = self.summaries.contains_key(&callee_key);
+        if let Some(sink_kind) = classify_call_sink(call, callee_known) {
             for argument in &argument_values {
+                let sink_detail = Some(format!(
+                    "{}::{} [{}]",
+                    call.module,
+                    call.name,
+                    sink_kind.label()
+                ));
                 for origin in &argument.risky_origins {
-                    self.emit_sink(origin, exp.exp.loc, SinkKind::CallArgument, financial, state, Some(call_name.clone()));
+                    self.emit_sink(
+                        origin,
+                        exp.exp.loc,
+                        SinkKind::CallArgument,
+                        sink_kind.is_critical(),
+                        state,
+                        sink_detail.clone(),
+                    );
                 }
+                self.emit_rounding_mismatch_sink(
+                    argument,
+                    exp.exp.loc,
+                    SinkKind::CallArgument,
+                    sink_kind.is_critical(),
+                    state,
+                    sink_detail,
+                );
             }
         }
 
@@ -817,10 +1051,6 @@ impl<'a> FunctionAnalyzer<'a> {
             .into_iter()
             .map(|component| type_interval(&component))
             .collect::<Vec<_>>();
-        let callee_key = FunctionKey {
-            module: call.module,
-            name: call.name,
-        };
         let Some(summary) = self.summaries.get(&callee_key) else {
             return if default_returns.is_empty() {
                 vec![type_interval(&exp.ty)]
@@ -833,13 +1063,20 @@ impl<'a> FunctionAnalyzer<'a> {
         }
         let mut results = vec![];
         for (index, return_summary) in summary.returns.iter().enumerate() {
-            let mut value = default_returns.get(index).cloned().unwrap_or_else(ValueState::top);
+            let mut value = default_returns
+                .get(index)
+                .cloned()
+                .unwrap_or_else(ValueState::top);
             let mut dependencies = BTreeSet::new();
             for dependency in &return_summary.parameter_dependencies {
                 if let Some(argument) = argument_values.get(*dependency) {
                     dependencies.extend(argument.parameter_dependencies.iter().copied());
                     for origin in &argument.risky_origins {
-                        if value.risky_origins.iter().all(|existing| existing.key != origin.key) {
+                        if value
+                            .risky_origins
+                            .iter()
+                            .all(|existing| existing.key != origin.key)
+                        {
                             value.risky_origins.push(origin.clone());
                         }
                     }
@@ -850,8 +1087,7 @@ impl<'a> FunctionAnalyzer<'a> {
             for origin in &return_summary.risky_origins {
                 if let Some(param_index) = origin.source_param_index
                     && let Some(argument) = argument_values.get(param_index)
-                    && let Some(threshold) = origin.threshold
-                    && argument.interval.upper.is_some_and(|upper| upper <= threshold)
+                    && self.origin_discharged_by_argument(origin, argument)
                 {
                     continue;
                 }
@@ -860,6 +1096,7 @@ impl<'a> FunctionAnalyzer<'a> {
                     .source_param_index
                     .and_then(|param_index| argument_values.get(param_index))
                     .and_then(|argument| self.single_parameter_dependency(argument));
+                mapped_origin.helper_like = false;
                 if value
                     .risky_origins
                     .iter()
@@ -869,10 +1106,18 @@ impl<'a> FunctionAnalyzer<'a> {
                 }
             }
             if call_name.contains("mul") && argument_values.len() >= 2 {
-                value.formula_facts =
-                    self.combine_mul_formula(&argument_values[0], &argument_values[1]);
+                value.formula_facts = self.combine_mul_formula(
+                    &argument_values[0],
+                    &argument_values[1],
+                    format!("{}::{}", call.module, call.name),
+                );
             }
             if call_name.contains("div") && argument_values.len() >= 2 {
+                value.formula_facts = self.combine_div_formula(
+                    &argument_values[0],
+                    &argument_values[1],
+                    format!("{}::{}", call.module, call.name),
+                );
                 if let Some(origin) = self.make_weak_denominator_origin(
                     exp,
                     &argument_values[0],
@@ -882,6 +1127,25 @@ impl<'a> FunctionAnalyzer<'a> {
                     state,
                 ) {
                     self.push_origin(&mut value, origin);
+                }
+            }
+            if let Some(facts) = &mut value.formula_facts {
+                let lowered = call_name.to_ascii_lowercase();
+                if lowered.contains("ceil")
+                    || lowered.contains("round_up")
+                    || lowered.contains("div_up")
+                {
+                    facts.rounding_mode = RoundingMode::RoundUp;
+                    facts.rounding_trace.push(format!("{}::{} => round_up", call.module, call.name));
+                } else if lowered.contains("floor")
+                    || lowered.contains("round_down")
+                    || lowered.contains("div_down")
+                {
+                    facts.rounding_mode = RoundingMode::RoundDown;
+                    facts.rounding_trace.push(format!(
+                        "{}::{} => round_down",
+                        call.module, call.name
+                    ));
                 }
             }
             results.push(value);
@@ -895,7 +1159,7 @@ impl<'a> FunctionAnalyzer<'a> {
         lhs_exp: &H::Exp,
         lhs: ValueState,
         op: BinOp_,
-        _rhs_exp: &H::Exp,
+        rhs_exp: &H::Exp,
         rhs: ValueState,
         state: &AbstractState,
     ) -> ValueState {
@@ -907,24 +1171,52 @@ impl<'a> FunctionAnalyzer<'a> {
 
         match op {
             BinOp_::Add => {
-                value.interval = checked_binary_interval(&lhs.interval, &rhs.interval, result_width, U256::checked_add);
-                value.bit_facts = self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| l.checked_add(r));
-                value.formula_facts = None;
+                value.interval = checked_binary_interval(
+                    &lhs.interval,
+                    &rhs.interval,
+                    result_width,
+                    U256::checked_add,
+                );
+                value.bit_facts =
+                    self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
+                        l.checked_add(r)
+                    });
+                value.formula_facts = self.combine_add_formula(&lhs, &rhs, self.describe_exp(exp));
             }
             BinOp_::Sub => {
-                value.interval = checked_binary_interval(&lhs.interval, &rhs.interval, result_width, U256::checked_sub);
-                value.bit_facts = self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| l.checked_sub(r));
-                value.formula_facts = self.combine_sub_formula(&lhs, &rhs);
+                value.interval = checked_binary_interval(
+                    &lhs.interval,
+                    &rhs.interval,
+                    result_width,
+                    U256::checked_sub,
+                );
+                value.bit_facts =
+                    self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
+                        l.checked_sub(r)
+                    });
+                value.formula_facts = self.combine_sub_formula(&lhs, &rhs, self.describe_exp(exp));
             }
             BinOp_::Mul => {
-                value.interval = checked_binary_interval(&lhs.interval, &rhs.interval, result_width, U256::checked_mul);
-                value.bit_facts = self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| l.checked_mul(r));
-                value.formula_facts = self.combine_mul_formula(&lhs, &rhs);
+                value.interval = checked_binary_interval(
+                    &lhs.interval,
+                    &rhs.interval,
+                    result_width,
+                    U256::checked_mul,
+                );
+                value.bit_facts =
+                    self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
+                        l.checked_mul(r)
+                    });
+                value.formula_facts = self.combine_mul_formula(&lhs, &rhs, self.describe_exp(exp));
             }
             BinOp_::Div => {
                 if rhs.interval.lower.is_some_and(|lower| lower > U256::zero())
-                    && let (Some(lo), Some(hi), Some(rlo), Some(rhi)) =
-                        (lhs.interval.lower, lhs.interval.upper, rhs.interval.lower, rhs.interval.upper)
+                    && let (Some(lo), Some(hi), Some(rlo), Some(rhi)) = (
+                        lhs.interval.lower,
+                        lhs.interval.upper,
+                        rhs.interval.lower,
+                        rhs.interval.upper,
+                    )
                 {
                     value.interval = Interval {
                         lower: Some(lo / rhi),
@@ -932,44 +1224,42 @@ impl<'a> FunctionAnalyzer<'a> {
                         bottom: false,
                     };
                 } else {
-                    value.interval = result_width.map_or_else(Interval::top, |width| {
-                        Interval {
-                            lower: Some(U256::zero()),
-                            upper: Some(uint_max(width)),
-                            bottom: false,
-                        }
+                    value.interval = result_width.map_or_else(Interval::top, |width| Interval {
+                        lower: Some(U256::zero()),
+                        upper: Some(uint_max(width)),
+                        bottom: false,
                     });
                 }
-                value.bit_facts = self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
-                    if r == U256::zero() {
-                        None
-                    } else {
-                        l.checked_div(r)
-                    }
-                });
-                value.formula_facts = None;
+                value.bit_facts =
+                    self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
+                        if r == U256::zero() {
+                            None
+                        } else {
+                            l.checked_div(r)
+                        }
+                    });
+                value.formula_facts = self.combine_div_formula(&lhs, &rhs, self.describe_exp(exp));
                 if let Some(origin) =
-                    self.make_weak_denominator_origin(exp, &lhs, lhs_exp, &rhs, _rhs_exp, state)
+                    self.make_weak_denominator_origin(exp, &lhs, lhs_exp, &rhs, rhs_exp, state)
                 {
                     self.push_origin(&mut value, origin);
                 }
             }
             BinOp_::Mod => {
-                value.interval = result_width.map_or_else(Interval::top, |width| {
-                    Interval {
-                        lower: Some(U256::zero()),
-                        upper: Some(uint_max(width)),
-                        bottom: false,
-                    }
+                value.interval = result_width.map_or_else(Interval::top, |width| Interval {
+                    lower: Some(U256::zero()),
+                    upper: Some(uint_max(width)),
+                    bottom: false,
                 });
-                value.bit_facts = self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
-                    if r == U256::zero() {
-                        None
-                    } else {
-                        l.checked_rem(r)
-                    }
-                });
-                value.formula_facts = None;
+                value.bit_facts =
+                    self.derive_numeric_bit_facts(&lhs, &rhs, result_width, |l, r| {
+                        if r == U256::zero() {
+                            None
+                        } else {
+                            l.checked_rem(r)
+                        }
+                    });
+                value.formula_facts = self.combine_mod_formula(&lhs, &rhs, self.describe_exp(exp));
             }
             BinOp_::BitAnd => {
                 if let Some(width) = result_width {
@@ -993,14 +1283,20 @@ impl<'a> FunctionAnalyzer<'a> {
                                 Some(width),
                                 None,
                                 None,
-                                "Bitwise arithmetic result remains non-exact before downstream use".to_string(),
-                                "Suspicious bitwise result may influence downstream arithmetic".to_string(),
+                                "Bitwise arithmetic result remains non-exact before downstream use"
+                                    .to_string(),
+                                "Suspicious bitwise result may influence downstream arithmetic"
+                                    .to_string(),
                                 false,
+                                ObligationKind::None,
+                                ProofMode::Abstract,
+                                None,
                             ),
                         );
                     }
                 }
-                value.formula_facts = None;
+                value.formula_facts =
+                    self.combine_shift_formula(&lhs, &rhs, ExprOp::Shl, self.describe_exp(exp));
             }
             BinOp_::BitOr => {
                 if let Some(width) = result_width {
@@ -1024,14 +1320,20 @@ impl<'a> FunctionAnalyzer<'a> {
                                 Some(width),
                                 None,
                                 None,
-                                "Bitwise arithmetic result remains non-exact before downstream use".to_string(),
-                                "Suspicious bitwise result may influence downstream arithmetic".to_string(),
+                                "Bitwise arithmetic result remains non-exact before downstream use"
+                                    .to_string(),
+                                "Suspicious bitwise result may influence downstream arithmetic"
+                                    .to_string(),
                                 false,
+                                ObligationKind::None,
+                                ProofMode::Abstract,
+                                None,
                             ),
                         );
                     }
                 }
-                value.formula_facts = None;
+                value.formula_facts =
+                    self.combine_shift_formula(&lhs, &rhs, ExprOp::Shr, self.describe_exp(exp));
             }
             BinOp_::Xor => {
                 if let Some(width) = result_width {
@@ -1055,9 +1357,14 @@ impl<'a> FunctionAnalyzer<'a> {
                                 Some(width),
                                 None,
                                 None,
-                                "Bitwise arithmetic result remains non-exact before downstream use".to_string(),
-                                "Suspicious bitwise result may influence downstream arithmetic".to_string(),
+                                "Bitwise arithmetic result remains non-exact before downstream use"
+                                    .to_string(),
+                                "Suspicious bitwise result may influence downstream arithmetic"
+                                    .to_string(),
                                 false,
+                                ObligationKind::None,
+                                ProofMode::Abstract,
+                                None,
                             ),
                         );
                     }
@@ -1075,7 +1382,7 @@ impl<'a> FunctionAnalyzer<'a> {
                                     RiskKind::InvalidShiftCount,
                                     exp,
                                     &rhs,
-                                    _rhs_exp,
+                                    rhs_exp,
                                     state,
                                     Some(width),
                                     Some(shift_amount),
@@ -1083,6 +1390,9 @@ impl<'a> FunctionAnalyzer<'a> {
                                     format!("{shift_amount} < {width}"),
                                     "Invalid shift count is reachable".to_string(),
                                     false,
+                                    ObligationKind::None,
+                                    ProofMode::Abstract,
+                                    None,
                                 ),
                             );
                             value.interval = Interval::top();
@@ -1090,21 +1400,26 @@ impl<'a> FunctionAnalyzer<'a> {
                         } else {
                             let threshold = no_truncation_threshold(width, shift_amount);
                             let guard_upper_bound = self.strongest_upper_bound(lhs_exp, state);
-                            let helper_like = looks_like_helper(&self.info.key.name.to_string());
+                            let has_guard = guard_upper_bound.is_some();
+                            let guard_mismatch =
+                                guard_is_weaker_than_threshold(guard_upper_bound, threshold);
                             if lhs.interval.upper.is_some_and(|upper| upper <= threshold) {
-                                if let (Some(lo), Some(hi)) = (lhs.interval.lower, lhs.interval.upper) {
+                                if let (Some(lo), Some(hi)) =
+                                    (lhs.interval.lower, lhs.interval.upper)
+                                {
                                     value.interval = Interval {
                                         lower: lo.checked_shl(shift_amount as u32),
                                         upper: hi.checked_shl(shift_amount as u32),
                                         bottom: false,
                                     };
                                 }
-                                value.bit_facts = lhs.bit_facts.as_ref().map(|facts| facts.shift_left(shift_amount, width));
+                                value.bit_facts = lhs
+                                    .bit_facts
+                                    .as_ref()
+                                    .map(|facts| facts.shift_left(shift_amount, width));
                                 value.refine_with_bit_facts();
                             } else {
-                                let kind = if helper_like
-                                    && guard_is_weaker_than_threshold(guard_upper_bound, threshold)
-                                {
+                                let kind = if has_guard && guard_mismatch {
                                     RiskKind::FakeCheckedShift
                                 } else {
                                     RiskKind::ReachableShiftTruncation
@@ -1124,12 +1439,15 @@ impl<'a> FunctionAnalyzer<'a> {
                                             "{} <= {threshold} (MAX_U{width} >> {shift_amount})",
                                             self.describe_exp(lhs_exp)
                                         ),
-                                        if helper_like {
+                                        if has_guard && guard_mismatch {
                                             "Unsound checked-shift helper is reachable".to_string()
                                         } else {
                                             "Reachable truncating left shift".to_string()
                                         },
-                                        guard_is_weaker_than_threshold(guard_upper_bound, threshold),
+                                        guard_mismatch,
+                                        ObligationKind::None,
+                                        ProofMode::Abstract,
+                                        None,
                                     ),
                                 );
                                 value.interval = Interval {
@@ -1140,29 +1458,6 @@ impl<'a> FunctionAnalyzer<'a> {
                                 value.bit_facts = Some(BitFacts::unknown(width));
                             }
                         }
-                    } else if width == 256 {
-                        self.push_origin(
-                            &mut value,
-                            self.make_origin(
-                                RiskKind::DynamicU256Shift,
-                                exp,
-                                &rhs,
-                                _rhs_exp,
-                                state,
-                                Some(width),
-                                None,
-                                None,
-                                "shift amount is a reachable non-constant u256 driver".to_string(),
-                                "Dynamic u256 shift count is reachable".to_string(),
-                                false,
-                            ),
-                        );
-                        value.interval = Interval {
-                            lower: Some(U256::zero()),
-                            upper: result_max,
-                            bottom: false,
-                        };
-                        value.bit_facts = Some(BitFacts::unknown(width));
                     } else {
                         value.interval = Interval {
                             lower: Some(U256::zero()),
@@ -1185,7 +1480,7 @@ impl<'a> FunctionAnalyzer<'a> {
                                     RiskKind::InvalidShiftCount,
                                     exp,
                                     &rhs,
-                                    _rhs_exp,
+                                    rhs_exp,
                                     state,
                                     Some(width),
                                     Some(shift_amount),
@@ -1193,6 +1488,9 @@ impl<'a> FunctionAnalyzer<'a> {
                                     format!("{shift_amount} < {width}"),
                                     "Invalid shift count is reachable".to_string(),
                                     false,
+                                    ObligationKind::None,
+                                    ProofMode::Abstract,
+                                    None,
                                 ),
                             );
                             value.interval = Interval::top();
@@ -1205,10 +1503,15 @@ impl<'a> FunctionAnalyzer<'a> {
                                     bottom: false,
                                 };
                             }
-                            value.bit_facts = lhs.bit_facts.as_ref().map(|facts| facts.shift_right(shift_amount, width));
+                            value.bit_facts = lhs
+                                .bit_facts
+                                .as_ref()
+                                .map(|facts| facts.shift_right(shift_amount, width));
                             value.refine_with_bit_facts();
                             let discarded_mask = low_mask(shift_amount) & width_mask(width);
-                            if discarded_mask != U256::zero() && lhs.may_have_non_zero_bits(discarded_mask) {
+                            if discarded_mask != U256::zero()
+                                && lhs.may_have_non_zero_bits(discarded_mask)
+                            {
                                 self.push_origin(
                                     &mut value,
                                     self.make_origin(
@@ -1220,36 +1523,20 @@ impl<'a> FunctionAnalyzer<'a> {
                                         Some(width),
                                         Some(shift_amount),
                                         None,
-                                        format!("({} & {}) == 0", self.describe_exp(lhs_exp), discarded_mask),
+                                        format!(
+                                            "({} & {}) == 0",
+                                            self.describe_exp(lhs_exp),
+                                            discarded_mask
+                                        ),
                                         "Right shift may discard non-zero low bits".to_string(),
                                         false,
+                                        ObligationKind::None,
+                                        ProofMode::Abstract,
+                                        Some(RoundingMode::RoundDown),
                                     ),
                                 );
                             }
                         }
-                    } else if width == 256 {
-                        self.push_origin(
-                            &mut value,
-                            self.make_origin(
-                                RiskKind::DynamicU256Shift,
-                                exp,
-                                &rhs,
-                                _rhs_exp,
-                                state,
-                                Some(width),
-                                None,
-                                None,
-                                "shift amount is a reachable non-constant u256 driver".to_string(),
-                                "Dynamic u256 shift count is reachable".to_string(),
-                                false,
-                            ),
-                        );
-                        value.interval = Interval {
-                            lower: Some(U256::zero()),
-                            upper: result_max,
-                            bottom: false,
-                        };
-                        value.bit_facts = Some(BitFacts::unknown(width));
                     } else {
                         value.interval = Interval {
                             lower: Some(U256::zero()),
@@ -1261,7 +1548,14 @@ impl<'a> FunctionAnalyzer<'a> {
                 }
                 value.formula_facts = None;
             }
-            BinOp_::Eq | BinOp_::Neq | BinOp_::Lt | BinOp_::Le | BinOp_::Gt | BinOp_::Ge | BinOp_::And | BinOp_::Or => {
+            BinOp_::Eq
+            | BinOp_::Neq
+            | BinOp_::Lt
+            | BinOp_::Le
+            | BinOp_::Gt
+            | BinOp_::Ge
+            | BinOp_::And
+            | BinOp_::Or => {
                 value.interval = Interval {
                     lower: Some(U256::zero()),
                     upper: Some(U256::one()),
@@ -1283,12 +1577,13 @@ impl<'a> FunctionAnalyzer<'a> {
                     | RiskKind::FakeCheckedShift
                     | RiskKind::InvalidShiftCount
                     | RiskKind::ReachableLossyRightShift
-                    | RiskKind::DynamicU256Shift
             )
         });
-        let suppress_suspicious = has_shift_or_precision_origin || matches!(op, BinOp_::Shl | BinOp_::Shr);
+        let suppress_suspicious =
+            has_shift_or_precision_origin || matches!(op, BinOp_::Shl | BinOp_::Shr);
         if suppress_suspicious {
-            value.risky_origins
+            value
+                .risky_origins
                 .retain(|origin| origin.kind != RiskKind::SuspiciousBitwiseArithmetic);
         }
         if matches!(
@@ -1302,8 +1597,36 @@ impl<'a> FunctionAnalyzer<'a> {
                 | BinOp_::Shr
         ) {
             let detail = Some(self.describe_exp(exp));
-            self.emit_arithmetic_use(&lhs.risky_origins, exp.exp.loc, state, detail.clone(), suppress_suspicious);
-            self.emit_arithmetic_use(&rhs.risky_origins, exp.exp.loc, state, detail, suppress_suspicious);
+            self.emit_arithmetic_use(
+                &lhs.risky_origins,
+                exp.exp.loc,
+                state,
+                detail.clone(),
+                suppress_suspicious,
+            );
+            self.emit_arithmetic_use(
+                &rhs.risky_origins,
+                exp.exp.loc,
+                state,
+                detail,
+                suppress_suspicious,
+            );
+            self.emit_rounding_mismatch_sink(
+                &lhs,
+                exp.exp.loc,
+                SinkKind::ArithmeticUse,
+                false,
+                state,
+                Some(self.describe_exp(exp)),
+            );
+            self.emit_rounding_mismatch_sink(
+                &rhs,
+                exp.exp.loc,
+                SinkKind::ArithmeticUse,
+                false,
+                state,
+                Some(self.describe_exp(exp)),
+            );
         }
         value
     }
@@ -1321,95 +1644,357 @@ impl<'a> FunctionAnalyzer<'a> {
         Some(BitFacts::exact(width, op(lhs, rhs)?))
     }
 
-    fn combine_sub_formula(&self, lhs: &ValueState, rhs: &ValueState) -> Option<FormulaFacts> {
-        let lhs_facts = lhs.formula_facts.as_ref()?;
-        let rhs_facts = rhs.formula_facts.as_ref()?;
-        if lhs_facts.tags.contains(&FormulaTag::PriceLike)
-            && rhs_facts.tags.contains(&FormulaTag::PriceLike)
+    fn combine_add_formula(
+        &self,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        expression_debug: String,
+    ) -> Option<FormulaFacts> {
+        let lhs_facts = lhs.formula_facts.as_ref();
+        let rhs_facts = rhs.formula_facts.as_ref();
+        if lhs_facts.is_none() && rhs_facts.is_none() {
+            return None;
+        }
+        Some(FormulaFacts {
+            tags: self.union_formula_tags(lhs_facts, rhs_facts),
+            factors: self.merge_formula_factors(lhs_facts, rhs_facts),
+            root_expr: self.make_binary_expr(ExprOp::Add, lhs, rhs, expression_debug, true),
+            roles: BTreeSet::new(),
+            rounding_mode: self.merge_rounding_mode(lhs_facts, rhs_facts),
+            rounding_trace: self.merge_rounding_trace(lhs_facts, rhs_facts, "add"),
+            rounding_conflict: false,
+        })
+    }
+
+    fn combine_sub_formula(
+        &self,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        expression_debug: String,
+    ) -> Option<FormulaFacts> {
+        let lhs_facts = lhs.formula_facts.as_ref();
+        let rhs_facts = rhs.formula_facts.as_ref();
+        if lhs_facts.is_none() && rhs_facts.is_none() {
+            return None;
+        }
+        let mut tags = self.union_formula_tags(lhs_facts, rhs_facts);
+        if lhs_facts
+            .is_some_and(|facts| facts.tags.contains(&FormulaTag::PriceLike))
+            && rhs_facts.is_some_and(|facts| facts.tags.contains(&FormulaTag::PriceLike))
         {
-            let mut tags = formula_tags_from_name("sqrt_price_diff");
             tags.insert(FormulaTag::PriceDiff);
-            Some(FormulaFacts { tags, factors: vec![] })
+        }
+        let mut facts = FormulaFacts {
+            tags,
+            factors: self.merge_formula_factors(lhs_facts, rhs_facts),
+            root_expr: self.make_binary_expr(ExprOp::Sub, lhs, rhs, expression_debug, false),
+            roles: BTreeSet::from([SemanticRole::Difference]),
+            rounding_mode: self.merge_rounding_mode(lhs_facts, rhs_facts),
+            rounding_trace: self.merge_rounding_trace(lhs_facts, rhs_facts, "sub"),
+            rounding_conflict: false,
+        };
+        facts.add_role(SemanticRole::Difference);
+        Some(facts)
+    }
+
+    fn combine_mul_formula(
+        &self,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        expression_debug: String,
+    ) -> Option<FormulaFacts> {
+        let lhs_facts = lhs.formula_facts.as_ref();
+        let rhs_facts = rhs.formula_facts.as_ref();
+        if lhs_facts.is_none() && rhs_facts.is_none() {
+            return None;
+        }
+        let mut tags = self.union_formula_tags(lhs_facts, rhs_facts);
+        if lhs_facts
+            .is_some_and(|facts| facts.tags.contains(&FormulaTag::PriceLike))
+            && rhs_facts.is_some_and(|facts| facts.tags.contains(&FormulaTag::PriceLike))
+        {
+            tags.insert(FormulaTag::PriceProduct);
+            tags.insert(FormulaTag::DenominatorLike);
+        }
+        let mut facts = FormulaFacts {
+            tags,
+            factors: self.merge_formula_factors(lhs_facts, rhs_facts),
+            root_expr: self.make_binary_expr(ExprOp::Mul, lhs, rhs, expression_debug, true),
+            roles: BTreeSet::from([SemanticRole::MulFactor]),
+            rounding_mode: self.merge_rounding_mode(lhs_facts, rhs_facts),
+            rounding_trace: self.merge_rounding_trace(lhs_facts, rhs_facts, "mul"),
+            rounding_conflict: false,
+        };
+        facts.add_role(SemanticRole::MulFactor);
+        Some(facts)
+    }
+
+    fn combine_div_formula(
+        &self,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        expression_debug: String,
+    ) -> Option<FormulaFacts> {
+        let lhs_facts = lhs.formula_facts.as_ref();
+        let rhs_facts = rhs.formula_facts.as_ref();
+        if lhs_facts.is_none() && rhs_facts.is_none() {
+            return None;
+        }
+        let mut facts = FormulaFacts {
+            tags: self.union_formula_tags(lhs_facts, rhs_facts),
+            factors: self.merge_formula_factors(lhs_facts, rhs_facts),
+            root_expr: self.make_binary_expr(ExprOp::Div, lhs, rhs, expression_debug, false),
+            roles: BTreeSet::from([SemanticRole::DivLhs, SemanticRole::DivRhs]),
+            rounding_mode: RoundingMode::RoundDown,
+            rounding_trace: self.merge_rounding_trace(lhs_facts, rhs_facts, "div/floor"),
+            rounding_conflict: false,
+        };
+        facts.add_role(SemanticRole::DivLhs);
+        facts.add_role(SemanticRole::DivRhs);
+        Some(facts)
+    }
+
+    fn combine_mod_formula(
+        &self,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        expression_debug: String,
+    ) -> Option<FormulaFacts> {
+        let lhs_facts = lhs.formula_facts.as_ref();
+        let rhs_facts = rhs.formula_facts.as_ref();
+        if lhs_facts.is_none() && rhs_facts.is_none() {
+            return None;
+        }
+        let mut facts = FormulaFacts {
+            tags: self.union_formula_tags(lhs_facts, rhs_facts),
+            factors: self.merge_formula_factors(lhs_facts, rhs_facts),
+            root_expr: self.make_binary_expr(ExprOp::Mod, lhs, rhs, expression_debug, false),
+            roles: BTreeSet::from([SemanticRole::DivRhs]),
+            rounding_mode: RoundingMode::RoundDown,
+            rounding_trace: self.merge_rounding_trace(lhs_facts, rhs_facts, "mod/floor"),
+            rounding_conflict: false,
+        };
+        facts.add_role(SemanticRole::DivRhs);
+        Some(facts)
+    }
+
+    fn combine_shift_formula(
+        &self,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        op: ExprOp,
+        expression_debug: String,
+    ) -> Option<FormulaFacts> {
+        let lhs_facts = lhs.formula_facts.as_ref();
+        let rhs_facts = rhs.formula_facts.as_ref();
+        if lhs_facts.is_none() && rhs_facts.is_none() {
+            return None;
+        }
+        let rounding_mode = if op == ExprOp::Shr {
+            RoundingMode::RoundDown
         } else {
-            None
+            self.merge_rounding_mode(lhs_facts, rhs_facts)
+        };
+        let trace = if op == ExprOp::Shr {
+            "shr/floor"
+        } else {
+            "shl/scale"
+        };
+        let mut facts = FormulaFacts {
+            tags: self.union_formula_tags(lhs_facts, rhs_facts),
+            factors: self.merge_formula_factors(lhs_facts, rhs_facts),
+            root_expr: self.make_binary_expr(op, lhs, rhs, expression_debug, false),
+            roles: BTreeSet::from([SemanticRole::Pow2Scale]),
+            rounding_mode,
+            rounding_trace: self.merge_rounding_trace(lhs_facts, rhs_facts, trace),
+            rounding_conflict: false,
+        };
+        facts.add_role(SemanticRole::Pow2Scale);
+        Some(facts)
+    }
+
+    fn union_formula_tags(
+        &self,
+        lhs: Option<&FormulaFacts>,
+        rhs: Option<&FormulaFacts>,
+    ) -> BTreeSet<FormulaTag> {
+        let mut tags = BTreeSet::new();
+        if let Some(lhs) = lhs {
+            tags.extend(lhs.tags.iter().cloned());
+        }
+        if let Some(rhs) = rhs {
+            tags.extend(rhs.tags.iter().cloned());
+        }
+        tags
+    }
+
+    fn merge_formula_factors(
+        &self,
+        lhs: Option<&FormulaFacts>,
+        rhs: Option<&FormulaFacts>,
+    ) -> Vec<FormulaFactor> {
+        let mut factors: Vec<FormulaFactor> = vec![];
+        for source in [lhs, rhs].into_iter().flatten() {
+            for factor in &source.factors {
+                if let Some(existing) = factors.iter_mut().find(|known| known.id == factor.id) {
+                    existing.strict_positive &= factor.strict_positive;
+                    existing.tags.extend(factor.tags.iter().cloned());
+                    existing.roles.extend(factor.roles.iter().cloned());
+                    for loc in &factor.source_locs {
+                        if !existing.source_locs.contains(loc) {
+                            existing.source_locs.push(*loc);
+                        }
+                    }
+                    if existing.proof_mode != factor.proof_mode {
+                        existing.proof_mode = ProofMode::Heuristic;
+                    }
+                } else {
+                    factors.push(factor.clone());
+                }
+            }
+        }
+        factors
+    }
+
+    fn merge_rounding_mode(
+        &self,
+        lhs: Option<&FormulaFacts>,
+        rhs: Option<&FormulaFacts>,
+    ) -> RoundingMode {
+        match (lhs.map(|facts| facts.rounding_mode), rhs.map(|facts| facts.rounding_mode)) {
+            (Some(left), Some(right)) if left == right => left,
+            (Some(RoundingMode::Exact), Some(other)) => other,
+            (Some(other), Some(RoundingMode::Exact)) => other,
+            (Some(_), Some(_)) => RoundingMode::Unknown,
+            (Some(single), None) | (None, Some(single)) => single,
+            (None, None) => RoundingMode::Exact,
         }
     }
 
-    fn combine_mul_formula(&self, lhs: &ValueState, rhs: &ValueState) -> Option<FormulaFacts> {
-        let mut tags = BTreeSet::new();
-        let mut factors = vec![];
-        if let Some(lhs_facts) = &lhs.formula_facts {
-            tags.extend(lhs_facts.tags.iter().cloned());
-            factors.extend(lhs_facts.factors.iter().cloned());
+    fn merge_rounding_trace(
+        &self,
+        lhs: Option<&FormulaFacts>,
+        rhs: Option<&FormulaFacts>,
+        tail: &str,
+    ) -> Vec<String> {
+        let mut trace = vec![];
+        for source in [lhs, rhs].into_iter().flatten() {
+            for item in &source.rounding_trace {
+                if !trace.contains(item) {
+                    trace.push(item.clone());
+                }
+            }
         }
-        if let Some(rhs_facts) = &rhs.formula_facts {
-            tags.extend(rhs_facts.tags.iter().cloned());
-            factors.extend(rhs_facts.factors.iter().cloned());
+        if !tail.is_empty() {
+            trace.push(tail.to_string());
         }
-        if factors.is_empty() {
-            return None;
-        }
-        let lhs_tags = lhs
-            .formula_facts
-            .as_ref()
-            .map(|facts| &facts.tags)
-            .cloned()
-            .unwrap_or_default();
-        let rhs_tags = rhs
-            .formula_facts
-            .as_ref()
-            .map(|facts| &facts.tags)
-            .cloned()
-            .unwrap_or_default();
-        if lhs_tags.contains(&FormulaTag::PriceLike) && rhs_tags.contains(&FormulaTag::PriceLike) {
-            tags.insert(FormulaTag::PriceProduct);
-            tags.insert(FormulaTag::ClmmDenominator);
-            tags.insert(FormulaTag::DenominatorLike);
-        }
-        if (lhs_tags.contains(&FormulaTag::LiquidityLike) && rhs_tags.contains(&FormulaTag::PriceDiff))
-            || (rhs_tags.contains(&FormulaTag::LiquidityLike)
-                && lhs_tags.contains(&FormulaTag::PriceDiff))
+        trace
+    }
+
+    fn root_expr_from_value(&self, value: &ValueState) -> Option<ExprNode> {
+        if let Some(facts) = &value.formula_facts
+            && let Some(expr) = &facts.root_expr
         {
-            tags.insert(FormulaTag::LiquidityScaled);
-            tags.insert(FormulaTag::ClmmNumerator);
+            return Some(expr.clone());
         }
-        Some(FormulaFacts { tags, factors })
+        value.exact_value().map(|constant| {
+            let debug = constant.to_string();
+            ExprNode {
+                id: stable_hash(&[b"const", debug.as_bytes()]),
+                op: ExprOp::Const,
+                children: vec![],
+                debug,
+            }
+        })
+    }
+
+    fn make_binary_expr(
+        &self,
+        op: ExprOp,
+        lhs: &ValueState,
+        rhs: &ValueState,
+        debug: String,
+        commutative: bool,
+    ) -> Option<ExprNode> {
+        let lhs = self.root_expr_from_value(lhs)?;
+        let rhs = self.root_expr_from_value(rhs)?;
+        let mut children = vec![lhs.id, rhs.id];
+        if commutative {
+            children.sort_unstable();
+        }
+        let op_name = format!("{op:?}");
+        let child_strings = children
+            .iter()
+            .map(|id| id.to_string().into_bytes())
+            .collect::<Vec<_>>();
+        let mut hash_parts = vec![op_name.as_bytes()];
+        for child in &child_strings {
+            hash_parts.push(child.as_slice());
+        }
+        let id = stable_hash(&hash_parts);
+        Some(ExprNode {
+            id,
+            op,
+            children,
+            debug,
+        })
     }
 
     fn make_weak_denominator_origin(
         &self,
         exp: &H::Exp,
         numerator: &ValueState,
-        numerator_exp: &H::Exp,
+        _numerator_exp: &H::Exp,
         denominator: &ValueState,
         denominator_exp: &H::Exp,
         state: &AbstractState,
     ) -> Option<RiskOrigin> {
-        let denom_facts = denominator.formula_facts.as_ref()?;
-        let price_like_factors = denom_facts
-            .factors
-            .iter()
-            .filter(|factor| factor.tags.contains(&FormulaTag::PriceLike))
-            .collect::<Vec<_>>();
-        let price_like_factor_count = price_like_factors.len();
-        let structural_denominator = denom_facts.tags.contains(&FormulaTag::ClmmDenominator)
-            || price_like_factor_count >= 2;
-        if !structural_denominator {
-            return None;
+        let denom_facts = denominator.formula_facts.as_ref();
+        let mut factors = denom_facts
+            .map(|facts| facts.factors.clone())
+            .unwrap_or_default();
+        factors.sort_by_key(|factor| factor.id);
+        factors.dedup_by_key(|factor| factor.id);
+        if factors.is_empty() {
+            if let Some(root) = denom_facts.and_then(|facts| facts.root_expr.as_ref()) {
+                factors.push(FormulaFactor {
+                    id: root.id,
+                    name: root.debug.clone(),
+                    tags: BTreeSet::new(),
+                    roles: BTreeSet::from([SemanticRole::DivRhs]),
+                    strict_positive: denominator
+                        .interval
+                        .lower
+                        .is_some_and(|lower| lower > U256::zero()),
+                    source_locs: vec![denominator_exp.exp.loc],
+                    proof_mode: ProofMode::Abstract,
+                });
+            } else {
+                let expr_text = self.describe_exp(denominator_exp);
+                factors.push(FormulaFactor {
+                    id: stable_hash(&[
+                        b"synthetic-div-factor",
+                        expr_text.as_bytes(),
+                        self.info.key.name.to_string().as_bytes(),
+                    ]),
+                    name: expr_text,
+                    tags: BTreeSet::new(),
+                    roles: BTreeSet::from([SemanticRole::DivRhs]),
+                    strict_positive: denominator
+                        .interval
+                        .lower
+                        .is_some_and(|lower| lower > U256::zero()),
+                    source_locs: vec![denominator_exp.exp.loc],
+                    proof_mode: ProofMode::Heuristic,
+                });
+            }
         }
-        let is_clmm_like = denom_facts.tags.contains(&FormulaTag::ClmmDenominator)
-            && numerator
-                .formula_facts
-                .as_ref()
-                .is_some_and(|facts| facts.tags.contains(&FormulaTag::ClmmNumerator));
-        let relevant_factors = if price_like_factor_count >= 2 {
-            price_like_factors
-        } else {
-            denom_facts.factors.iter().collect::<Vec<_>>()
-        };
-        let all_relevant_factors_strict_positive =
-            !relevant_factors.is_empty() && relevant_factors.iter().all(|factor| factor.strict_positive);
-        let zero_reachable = if all_relevant_factors_strict_positive {
+        let is_product = denom_facts
+            .and_then(|facts| facts.root_expr.as_ref())
+            .is_some_and(|root| root.op == ExprOp::Mul)
+            || factors.len() >= 2;
+        let all_factors_positive = factors.iter().all(|factor| factor.strict_positive);
+        let zero_reachable = if all_factors_positive {
             false
         } else {
             denominator
@@ -1417,39 +2002,38 @@ impl<'a> FunctionAnalyzer<'a> {
                 .lower
                 .is_none_or(|lower| lower == U256::zero())
         };
-        if !zero_reachable && all_relevant_factors_strict_positive {
+        let require_factor_positivity =
+            is_product && self.invariant_mode_requires_independent_factor_proofs(numerator);
+        let violates_non_zero = zero_reachable;
+        let violates_factor_positivity = require_factor_positivity && !all_factors_positive;
+        if !violates_non_zero && !violates_factor_positivity {
             return None;
         }
-        if !zero_reachable && !is_clmm_like {
-            return None;
-        }
-        let factor_condition = if relevant_factors.is_empty() {
-            format!("{} > 0", self.describe_exp(denominator_exp))
+        let obligation_kind = if violates_non_zero {
+            ObligationKind::NonZeroDivisor
         } else {
-            relevant_factors
-                .iter()
-                .map(|factor| format!("{} > 0", factor.name))
-                .collect::<Vec<_>>()
-                .join(" && ")
+            ObligationKind::IndependentFactorPositivity
         };
-        let title = if zero_reachable {
-            if is_clmm_like {
-                "CLMM denominator may be zero on a reachable quote path"
-            } else {
+        let failed_condition = match obligation_kind {
+            ObligationKind::NonZeroDivisor => format!("{} != 0", self.describe_exp(denominator_exp)),
+            ObligationKind::IndependentFactorPositivity => factors
+                .iter()
+                .map(|factor| format!("{} > 0", self.factor_label(factor)))
+                .collect::<Vec<_>>()
+                .join(" && "),
+            _ => "denominator obligations hold".to_string(),
+        };
+        let title = match obligation_kind {
+            ObligationKind::NonZeroDivisor => {
                 "Denominator may be zero on a reachable value-bearing path"
             }
-        } else if is_clmm_like {
-            "CLMM denominator factors are not independently proven positive"
-        } else {
-            "Denominator factors are not independently proven positive"
+            ObligationKind::IndependentFactorPositivity => {
+                "Independent denominator factors are not all proven strictly positive"
+            }
+            _ => "Potential denominator obligation failure",
         }
         .to_string();
-        let source_value = if zero_reachable { denominator } else { numerator };
-        let source_exp = if zero_reachable {
-            denominator_exp
-        } else {
-            numerator_exp
-        };
+        let proof_mode = self.obligation_proof_mode(denominator_exp, state, denom_facts.is_some());
         Some(RiskOrigin {
             key: format!(
                 "{}:{}:{}",
@@ -1462,21 +2046,76 @@ impl<'a> FunctionAnalyzer<'a> {
             source_param_index: self.single_parameter_dependency(denominator),
             width: denominator.width(),
             shift_amount: None,
-            threshold: if zero_reachable {
+            threshold: if violates_non_zero {
                 Some(U256::zero())
             } else {
                 None
             },
             title,
             expr_text: self.describe_exp(exp),
-            failed_condition: factor_condition,
+            failed_condition,
             path_facts: self.path_fact_texts(state),
-            source_interval: source_value.interval.describe(),
-            source_name: self.describe_exp(source_exp),
+            source_interval: denominator.interval.describe(),
+            source_name: self.describe_exp(denominator_exp),
             helper_name: Some(self.info.key.name.to_string()),
-            helper_like: looks_like_helper(&self.info.key.name.to_string()),
+            helper_like: self.is_denominator_helper_context(),
             guard_mismatch: false,
+            obligation_kind,
+            proof_mode,
+            rounding_mode: denom_facts.map(|facts| facts.rounding_mode),
         })
+    }
+
+    fn factor_label(&self, factor: &FormulaFactor) -> String {
+        if !factor.name.is_empty() {
+            factor.name.clone()
+        } else {
+            format!("factor#{}", factor.id)
+        }
+    }
+
+    fn invariant_mode_requires_independent_factor_proofs(&self, numerator: &ValueState) -> bool {
+        matches!(self.math_mode, SecurityMathMode::Deep)
+            || numerator
+                .formula_facts
+                .as_ref()
+                .is_some_and(|facts| !facts.factors.is_empty() || facts.root_expr.is_some())
+    }
+
+    fn obligation_proof_mode(
+        &self,
+        _denominator_exp: &H::Exp,
+        _state: &AbstractState,
+        semantic_available: bool,
+    ) -> ProofMode {
+        if !semantic_available {
+            return ProofMode::Heuristic;
+        }
+        ProofMode::Abstract
+    }
+
+    fn is_denominator_helper_context(&self) -> bool {
+        if self.info.function.entry.is_some() {
+            return false;
+        }
+        let lowered = self.info.key.name.to_string().to_ascii_lowercase();
+        lowered.contains("div")
+            || lowered.contains("quotient")
+            || lowered.contains("checked")
+            || lowered.contains("mul_shr")
+    }
+
+    fn describe_obligation(&self, obligation_kind: ObligationKind) -> &'static str {
+        match obligation_kind {
+            ObligationKind::None => "none",
+            ObligationKind::NonZeroDivisor => "divisor must be non-zero",
+            ObligationKind::IndependentFactorPositivity => {
+                "each independent denominator factor must be strictly positive"
+            }
+            ObligationKind::RoundingConsistency => {
+                "rounding mode must be consistent for semantically related quantities"
+            }
+        }
     }
 
     fn bit_facts_for_binary(
@@ -1514,6 +2153,9 @@ impl<'a> FunctionAnalyzer<'a> {
         failed_condition: String,
         title: String,
         guard_mismatch: bool,
+        obligation_kind: ObligationKind,
+        proof_mode: ProofMode,
+        rounding_mode: Option<RoundingMode>,
     ) -> RiskOrigin {
         RiskOrigin {
             key: format!(
@@ -1535,8 +2177,11 @@ impl<'a> FunctionAnalyzer<'a> {
             source_interval: source_value.interval.describe(),
             source_name: self.describe_exp(source_exp),
             helper_name: Some(self.info.key.name.to_string()),
-            helper_like: looks_like_helper(&self.info.key.name.to_string()),
+            helper_like: false,
             guard_mismatch,
+            obligation_kind,
+            proof_mode,
+            rounding_mode,
         }
     }
 
@@ -1562,7 +2207,6 @@ impl<'a> FunctionAnalyzer<'a> {
             if !matches!(
                 origin.kind,
                 RiskKind::ReachableLossyRightShift
-                    | RiskKind::DynamicU256Shift
                     | RiskKind::SuspiciousBitwiseArithmetic
                     | RiskKind::ReachableWeakDenominator
             ) {
@@ -1582,6 +2226,86 @@ impl<'a> FunctionAnalyzer<'a> {
         }
     }
 
+    fn emit_rounding_mismatch_sink(
+        &mut self,
+        value: &ValueState,
+        sink_loc: Loc,
+        sink_kind: SinkKind,
+        financial: bool,
+        state: &AbstractState,
+        detail: Option<String>,
+    ) {
+        let Some(facts) = &value.formula_facts else {
+            return;
+        };
+        if !facts.rounding_conflict {
+            return;
+        }
+        if facts.factors.is_empty() && facts.root_expr.is_none() {
+            return;
+        }
+        let root_id = facts.root_expr.as_ref().map(|root| root.id).unwrap_or_default();
+        let mut sink_detail = detail.unwrap_or_default();
+        if !facts.rounding_trace.is_empty() {
+            if !sink_detail.is_empty() {
+                sink_detail.push_str("; ");
+            }
+            sink_detail.push_str(&format!(
+                "rounding trace: {}",
+                facts.rounding_trace.join(" -> ")
+            ));
+        }
+        let origin = RiskOrigin {
+            key: format!(
+                "{}:{}:{}:{}",
+                RiskKind::ReachableRoundingMismatch.rule_id(),
+                sink_loc.file_hash(),
+                sink_loc.start(),
+                root_id
+            ),
+            kind: RiskKind::ReachableRoundingMismatch,
+            loc: sink_loc,
+            source_param_index: self.single_parameter_dependency(value),
+            width: value.width(),
+            shift_amount: None,
+            threshold: None,
+            title: "Semantically related value reaches sink with incompatible rounding modes"
+                .to_string(),
+            expr_text: if sink_detail.is_empty() {
+                "value".to_string()
+            } else {
+                sink_detail.clone()
+            },
+            failed_condition:
+                "consistent rounding mode across all reachable paths for this quantity".to_string(),
+            path_facts: self.path_fact_texts(state),
+            source_interval: value.interval.describe(),
+            source_name: facts
+                .root_expr
+                .as_ref()
+                .map(|root| root.debug.clone())
+                .unwrap_or_else(|| "value".to_string()),
+            helper_name: Some(self.info.key.name.to_string()),
+            helper_like: false,
+            guard_mismatch: false,
+            obligation_kind: ObligationKind::RoundingConsistency,
+            proof_mode: ProofMode::Abstract,
+            rounding_mode: Some(facts.rounding_mode),
+        };
+        self.emit_sink(
+            &origin,
+            sink_loc,
+            sink_kind,
+            financial,
+            state,
+            if sink_detail.is_empty() {
+                None
+            } else {
+                Some(sink_detail)
+            },
+        );
+    }
+
     fn emit_sink(
         &mut self,
         origin: &RiskOrigin,
@@ -1594,11 +2318,15 @@ impl<'a> FunctionAnalyzer<'a> {
         if self.mode != AnalysisMode::Findings {
             return;
         }
+        if origin.kind == RiskKind::ReachableWeakDenominator
+            && origin.helper_like
+            && matches!(sink_kind, SinkKind::PublicReturn | SinkKind::ArithmeticUse)
+        {
+            return;
+        }
         let priority = sink_priority(&sink_kind, financial);
         let severity = match origin.kind {
-            RiskKind::DynamicU256Shift | RiskKind::SuspiciousBitwiseArithmetic => {
-                Severity::Warning
-            }
+            RiskKind::SuspiciousBitwiseArithmetic => Severity::Warning,
             RiskKind::ReachableLossyRightShift => {
                 if priority >= 3 {
                     Severity::NonblockingError
@@ -1607,7 +2335,17 @@ impl<'a> FunctionAnalyzer<'a> {
                 }
             }
             RiskKind::ReachableWeakDenominator => {
-                if origin.threshold == Some(U256::zero()) && priority >= 1 {
+                if origin.threshold == Some(U256::zero())
+                    && priority >= 1
+                    && origin.proof_mode != ProofMode::Heuristic
+                {
+                    Severity::NonblockingError
+                } else {
+                    Severity::Warning
+                }
+            }
+            RiskKind::ReachableRoundingMismatch => {
+                if priority >= 1 {
                     Severity::NonblockingError
                 } else {
                     Severity::Warning
@@ -1622,14 +2360,24 @@ impl<'a> FunctionAnalyzer<'a> {
             }
         };
         let title = match origin.kind {
-            RiskKind::ReachableShiftTruncation => "Reachable truncating left shift on a value-bearing path",
-            RiskKind::FakeCheckedShift => "Custom checked-shift helper may be unsound on a reachable path",
-            RiskKind::ReachableNarrowCast => "Reachable narrowing cast may fail on a value-bearing path",
+            RiskKind::ReachableShiftTruncation => {
+                "Reachable truncating left shift on a value-bearing path"
+            }
+            RiskKind::FakeCheckedShift => {
+                "Custom checked-shift helper may be unsound on a reachable path"
+            }
+            RiskKind::ReachableNarrowCast => {
+                "Reachable narrowing cast may fail on a value-bearing path"
+            }
             RiskKind::InvalidShiftCount => "Reachable invalid shift count",
-            RiskKind::ReachableLossyRightShift => "Reachable lossy right shift on a value-bearing path",
-            RiskKind::DynamicU256Shift => "Dynamic u256 shift count reaches value-sensitive logic",
-            RiskKind::SuspiciousBitwiseArithmetic => "Suspicious bitwise result reaches downstream arithmetic",
+            RiskKind::ReachableLossyRightShift => {
+                "Reachable lossy right shift on a value-bearing path"
+            }
+            RiskKind::SuspiciousBitwiseArithmetic => {
+                "Suspicious bitwise result reaches downstream arithmetic"
+            }
             RiskKind::ReachableWeakDenominator => origin.title.as_str(),
+            RiskKind::ReachableRoundingMismatch => origin.title.as_str(),
         }
         .to_string();
         let mut path_facts = origin.path_facts.clone();
@@ -1649,11 +2397,16 @@ impl<'a> FunctionAnalyzer<'a> {
             },
             origin.source_interval
         );
+        message.push_str(&format!(
+            " Obligation: {}. Evidence: {:?}.",
+            self.describe_obligation(origin.obligation_kind.clone()),
+            origin.proof_mode
+        ));
+        if let Some(rounding_mode) = origin.rounding_mode {
+            message.push_str(&format!(" Rounding mode seen: {:?}.", rounding_mode));
+        }
         if origin.guard_mismatch {
             message.push_str(" A dominating helper guard exists, but it is weaker than the true no-truncation bound.");
-        }
-        if origin.kind == RiskKind::DynamicU256Shift {
-            message.push_str(" Unlike u8-u128 shifts, u256 shift counts are not runtime-checked by the Move VM.");
         }
         if let Some(ref detail) = detail {
             message.push_str(&format!(" Sink evidence: {detail}."));
@@ -1671,14 +2424,14 @@ impl<'a> FunctionAnalyzer<'a> {
             RiskKind::ReachableLossyRightShift => {
                 "Prove the discarded low bits are zero before using right shift as arithmetic, or use an exact division path where rounding is explicit.".to_string()
             }
-            RiskKind::DynamicU256Shift => {
-                "Use a constant shift amount or prove and guard the u256 shift count explicitly before value-sensitive math.".to_string()
-            }
             RiskKind::SuspiciousBitwiseArithmetic => {
                 "Prove the masked or combined bit range before reusing the value in arithmetic or sink-bearing logic.".to_string()
             }
             RiskKind::ReachableWeakDenominator => {
-                "Prove every denominator factor is strictly positive before dividing, and add explicit CLMM price-bound guards instead of relying on opaque helper behavior.".to_string()
+                "Prove `divisor != 0` on all paths and, for product denominators, prove each independent factor is strictly positive.".to_string()
+            }
+            RiskKind::ReachableRoundingMismatch => {
+                "Use one rounding policy for this quantity (all floor or all ceil), or add an explicit compensation invariant before the sink.".to_string()
             }
         };
         self.current_outcome.findings.push(SecurityFinding {
@@ -1712,40 +2465,68 @@ impl<'a> FunctionAnalyzer<'a> {
     }
 
     fn lookup_var(&self, state: &AbstractState, var: &H::Var) -> ValueState {
-        state
-            .locals
-            .get(var)
-            .cloned()
-            .unwrap_or_else(|| {
-                self.local_types
-                    .get(var)
-                    .map(type_interval)
-                    .unwrap_or_else(ValueState::top)
-            })
+        state.locals.get(var).cloned().unwrap_or_else(|| {
+            self.local_types
+                .get(var)
+                .map(type_interval)
+                .unwrap_or_else(ValueState::top)
+        })
     }
 
     fn annotate_value_with_name(&self, value: &mut ValueState, name: &str) {
-        let strict_positive = value.interval.lower.is_some_and(|lower| lower > U256::zero());
+        let strict_positive = value
+            .interval
+            .lower
+            .is_some_and(|lower| lower > U256::zero());
         let tags = formula_tags_from_name(name);
-        if tags.is_empty() {
-            return;
-        }
+        let id = stable_hash(&[b"var", name.as_bytes()]);
         match &mut value.formula_facts {
             Some(facts) => {
-                facts.merge_tags(tags.clone());
-                if let Some(existing) = facts.factors.iter_mut().find(|factor| factor.name == name) {
+                if !tags.is_empty() {
+                    facts.merge_tags(tags.clone());
+                }
+                if let Some(existing) = facts.factors.iter_mut().find(|factor| factor.id == id) {
                     existing.strict_positive = strict_positive;
                     existing.tags.extend(tags);
-                } else {
-                    facts.factors.push(crate::security_analysis::domain::FormulaFactor::new(
+                } else if facts.factors.is_empty() {
+                    facts.factors.push(FormulaFactor::new(
+                        id,
                         name.to_string(),
                         tags,
                         strict_positive,
+                        ProofMode::Abstract,
                     ));
+                }
+                if facts.root_expr.is_none() {
+                    facts.root_expr = Some(ExprNode {
+                        id,
+                        op: ExprOp::Var,
+                        children: vec![],
+                        debug: name.to_string(),
+                    });
                 }
             }
             None => {
-                value.formula_facts = FormulaFacts::from_name(name, strict_positive);
+                value.formula_facts = Some(FormulaFacts {
+                    tags: tags.clone(),
+                    factors: vec![FormulaFactor::new(
+                        id,
+                        name.to_string(),
+                        tags,
+                        strict_positive,
+                        ProofMode::Abstract,
+                    )],
+                    root_expr: Some(ExprNode {
+                        id,
+                        op: ExprOp::Var,
+                        children: vec![],
+                        debug: name.to_string(),
+                    }),
+                    roles: BTreeSet::new(),
+                    rounding_mode: RoundingMode::Exact,
+                    rounding_trace: vec![],
+                    rounding_conflict: false,
+                });
             }
         }
     }
@@ -1781,7 +2562,12 @@ impl<'a> FunctionAnalyzer<'a> {
     }
 
     fn is_publicish(&self) -> bool {
-        !matches!(self.info.function.visibility, H::Visibility::Internal) || self.info.function.entry.is_some()
+        !matches!(self.info.function.visibility, H::Visibility::Internal)
+            || self.info.function.entry.is_some()
+    }
+
+    fn is_value_api_surface(&self) -> bool {
+        self.info.function.entry.is_some() || self.info.function.signature.parameters.len() >= 2
     }
 
     fn single_parameter_dependency(&self, value: &ValueState) -> Option<usize> {
@@ -1789,6 +2575,29 @@ impl<'a> FunctionAnalyzer<'a> {
             value.parameter_dependencies.iter().next().copied()
         } else {
             None
+        }
+    }
+
+    fn origin_discharged_by_argument(&self, origin: &RiskOrigin, argument: &ValueState) -> bool {
+        match origin.obligation_kind {
+            ObligationKind::NonZeroDivisor => argument
+                .interval
+                .lower
+                .is_some_and(|lower| lower > U256::zero())
+                || argument
+                    .formula_facts
+                    .as_ref()
+                    .is_some_and(FormulaFacts::all_factors_strict_positive),
+            ObligationKind::IndependentFactorPositivity => argument
+                .formula_facts
+                .as_ref()
+                .is_some_and(FormulaFacts::all_factors_strict_positive),
+            _ => origin.threshold.is_some_and(|threshold| {
+                argument
+                    .interval
+                    .upper
+                    .is_some_and(|upper| upper <= threshold)
+            }),
         }
     }
 
@@ -1852,7 +2661,11 @@ impl<'a> FunctionAnalyzer<'a> {
     }
 
     fn path_fact_texts(&self, state: &AbstractState) -> Vec<String> {
-        state.path_facts.iter().map(|fact| fact.text.clone()).collect()
+        state
+            .path_facts
+            .iter()
+            .map(|fact| fact.text.clone())
+            .collect()
     }
 
     fn describe_exp(&self, exp: &H::Exp) -> String {
@@ -1869,7 +2682,12 @@ impl<'a> FunctionAnalyzer<'a> {
             E::BorrowLocal(_, var) => var.value().to_string(),
             E::UnaryExp(sp!(_, UnaryOp_::Not), inner) => format!("!{}", self.describe_exp(inner)),
             E::BinopExp(lhs, op, rhs) => {
-                format!("{} {} {}", self.describe_exp(lhs), op.value.symbol(), self.describe_exp(rhs))
+                format!(
+                    "{} {} {}",
+                    self.describe_exp(lhs),
+                    op.value.symbol(),
+                    self.describe_exp(rhs)
+                )
             }
             E::ModuleCall(call) => {
                 let args = call

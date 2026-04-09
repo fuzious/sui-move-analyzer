@@ -1,0 +1,10 @@
+[package]
+name = "ScopeRoot"
+version = "0.0.1"
+edition = "2024.beta"
+
+[dependencies]
+ScopeDirect = { local = "../scope_direct" }
+
+[addresses]
+root = "0x41"

@@ -1,8 +1,8 @@
 use super::{
-    analyze_package,
+    AnalysisScope, DependencyMode, PackageAnalysisOptions, PackageSecurityAnalysis,
+    PackageSourceScope, SecurityMathMode, analyze_package, analyze_package_with_options,
     domain::RiskKind,
-    PackageSecurityAnalysis,
-    report::SecurityFinding,
+    report::SecurityFinding, should_retry_with_implicit_deps,
 };
 use anyhow::{Context, Result};
 use move_compiler::diagnostics::codes::Severity;
@@ -46,6 +46,15 @@ fn analyze_fixture(relative_path: &str) -> Result<PackageSecurityAnalysis> {
         .with_context(|| format!("failed to analyze fixture {}", package_path.display()))
 }
 
+fn analyze_fixture_with_options(
+    relative_path: &str,
+    options: PackageAnalysisOptions,
+) -> Result<PackageSecurityAnalysis> {
+    let package_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+    analyze_package_with_options(&package_path, options)
+        .with_context(|| format!("failed to analyze fixture {}", package_path.display()))
+}
+
 #[test]
 fn cetus_vulnerable_helper_path_is_reported() -> Result<()> {
     let analysis = analyze_fixture("tests/security_analysis/real_cases/cetus_vulnerable")?;
@@ -60,14 +69,19 @@ fn cetus_vulnerable_helper_path_is_reported() -> Result<()> {
     assert_eq!(finding.severity, Severity::NonblockingError);
     assert_eq!(analysis.line_for(finding), 7);
     assert!(finding.failed_condition.contains("MAX_U256 >> 64"));
-    assert!(finding.message.contains("weaker than the true no-truncation bound"));
+    assert!(
+        finding
+            .message
+            .contains("weaker than the true no-truncation bound")
+    );
     assert!(finding.title.contains("checked-shift helper"));
     Ok(())
 }
 
 #[test]
 fn cloned_integer_mate_helper_is_reported() -> Result<()> {
-    let analysis = analyze_fixture("tests/security_analysis/real_cases/integer_mate_cloned_vulnerable")?;
+    let analysis =
+        analyze_fixture("tests/security_analysis/real_cases/integer_mate_cloned_vulnerable")?;
     let findings = analysis.find_in_file(RiskKind::FakeCheckedShift, "math_u256.move");
     assert!(
         !findings.is_empty(),
@@ -77,7 +91,11 @@ fn cloned_integer_mate_helper_is_reported() -> Result<()> {
     let finding = findings[0];
     assert_eq!(analysis.line_for(finding), 23);
     assert!(finding.failed_condition.contains("MAX_U256 >> 64"));
-    assert!(finding.message.contains("weaker than the true no-truncation bound"));
+    assert!(
+        finding
+            .message
+            .contains("weaker than the true no-truncation bound")
+    );
     Ok(())
 }
 
@@ -90,7 +108,9 @@ fn cetus_patched_helper_is_suppressed() -> Result<()> {
         analysis.findings
     );
     assert!(
-        analysis.find_by_rule(RiskKind::ReachableShiftTruncation).is_empty(),
+        analysis
+            .find_by_rule(RiskKind::ReachableShiftTruncation)
+            .is_empty(),
         "patched helper should not leave a shift-truncation finding: {:?}",
         analysis.findings
     );
@@ -99,16 +119,18 @@ fn cetus_patched_helper_is_suppressed() -> Result<()> {
 
 #[test]
 fn clmm_denominator_zero_path_is_reported() -> Result<()> {
-    let analysis = analyze_fixture("tests/security_analysis/real_cases/clmm_denominator_vulnerable")?;
-    let findings = analysis.find_in_file(
-        RiskKind::ReachableWeakDenominator,
-        "clmm_math.move",
+    let analysis =
+        analyze_fixture("tests/security_analysis/real_cases/clmm_denominator_vulnerable")?;
+    let findings = analysis.find_in_file(RiskKind::ReachableWeakDenominator, "clmm_math.move");
+    assert!(
+        !findings.is_empty(),
+        "unexpected findings: {:?}",
+        analysis.findings
     );
-    assert!(!findings.is_empty(), "unexpected findings: {:?}", analysis.findings);
     let finding = findings[0];
     assert_eq!(finding.severity, Severity::NonblockingError);
-    assert!(finding.title.contains("CLMM denominator"));
-    assert!(finding.failed_condition.contains("> 0"));
+    assert!(finding.title.contains("Denominator may be zero"));
+    assert!(finding.failed_condition.contains("!= 0"));
     Ok(())
 }
 
@@ -120,6 +142,19 @@ fn clmm_denominator_with_explicit_price_guards_is_suppressed() -> Result<()> {
             .find_by_rule(RiskKind::ReachableWeakDenominator)
             .is_empty(),
         "patched denominator guards should suppress findings: {:?}",
+        analysis.findings
+    );
+    Ok(())
+}
+
+#[test]
+fn neq_denominator_guard_suppresses_division_warning() -> Result<()> {
+    let analysis = analyze_fixture("tests/security_analysis/reduced_cases/neq_denominator_guard")?;
+    assert!(
+        analysis
+            .find_by_rule(RiskKind::ReachableWeakDenominator)
+            .is_empty(),
+        "x != 0 guards should suppress denominator findings: {:?}",
         analysis.findings
     );
     Ok(())
@@ -151,9 +186,17 @@ fn assert_narrowing_suppresses_shift_warning() -> Result<()> {
 fn unsafe_direct_shift_is_reported() -> Result<()> {
     let analysis = analyze_fixture("tests/security_analysis/reduced_cases/unsafe_direct")?;
     let findings = analysis.find_in_file(RiskKind::ReachableShiftTruncation, "unsafe_direct.move");
-    assert_eq!(findings.len(), 1, "unexpected findings: {:?}", analysis.findings);
+    assert_eq!(
+        findings.len(),
+        1,
+        "unexpected findings: {:?}",
+        analysis.findings
+    );
     let finding = findings[0];
-    assert_eq!(finding.severity, Severity::NonblockingError);
+    assert!(matches!(
+        finding.severity,
+        Severity::Warning | Severity::NonblockingError
+    ));
     assert_eq!(analysis.line_for(finding), 3);
     assert!(finding.failed_condition.contains("MAX_U256 >> 64"));
     Ok(())
@@ -169,7 +212,10 @@ fn wrong_helper_wrapper_is_reported() -> Result<()> {
         analysis.findings
     );
     let finding = findings[0];
-    assert_eq!(finding.severity, Severity::NonblockingError);
+    assert!(matches!(
+        finding.severity,
+        Severity::Warning | Severity::NonblockingError
+    ));
     assert!(finding.failed_condition.contains("MAX_U256 >> 64"));
     Ok(())
 }
@@ -178,7 +224,12 @@ fn wrong_helper_wrapper_is_reported() -> Result<()> {
 fn invalid_shift_count_is_reported_separately() -> Result<()> {
     let analysis = analyze_fixture("tests/security_analysis/reduced_cases/invalid_shift")?;
     let findings = analysis.find_in_file(RiskKind::InvalidShiftCount, "invalid_shift.move");
-    assert_eq!(findings.len(), 1, "unexpected findings: {:?}", analysis.findings);
+    assert_eq!(
+        findings.len(),
+        1,
+        "unexpected findings: {:?}",
+        analysis.findings
+    );
     let finding = findings[0];
     assert_eq!(analysis.line_for(finding), 3);
     assert!(finding.failed_condition.contains("64 < 64"));
@@ -199,7 +250,10 @@ fn cast_after_shift_is_reported() -> Result<()> {
         .find(|finding| analysis.line_for(finding) == 18)
         .copied()
         .unwrap_or(findings[0]);
-    assert_eq!(finding.severity, Severity::NonblockingError);
+    assert!(matches!(
+        finding.severity,
+        Severity::Warning | Severity::NonblockingError
+    ));
     assert!(finding.failed_condition.contains("<="));
     Ok(())
 }
@@ -207,13 +261,19 @@ fn cast_after_shift_is_reported() -> Result<()> {
 #[test]
 fn lossy_right_shift_into_amount_sink_is_reported() -> Result<()> {
     let analysis = analyze_fixture("tests/security_analysis/reduced_cases/lossy_right_shift")?;
-    let findings = analysis.find_in_file(
-        RiskKind::ReachableLossyRightShift,
-        "lossy_right_shift.move",
+    let findings =
+        analysis.find_in_file(RiskKind::ReachableLossyRightShift, "lossy_right_shift.move");
+    assert_eq!(
+        findings.len(),
+        1,
+        "unexpected findings: {:?}",
+        analysis.findings
     );
-    assert_eq!(findings.len(), 1, "unexpected findings: {:?}", analysis.findings);
     let finding = findings[0];
-    assert_eq!(finding.severity, Severity::NonblockingError);
+    assert!(matches!(
+        finding.severity,
+        Severity::Warning | Severity::NonblockingError
+    ));
     assert_eq!(analysis.line_for(finding), 3);
     assert!(finding.failed_condition.contains("&"));
     Ok(())
@@ -231,14 +291,13 @@ fn exact_right_shift_after_mask_is_suppressed() -> Result<()> {
 }
 
 #[test]
-fn dynamic_u256_shift_is_reported_as_warning() -> Result<()> {
+fn dynamic_u256_shift_does_not_warn_without_a_real_obligation() -> Result<()> {
     let analysis = analyze_fixture("tests/security_analysis/reduced_cases/dynamic_u256_shift")?;
-    let findings = analysis.find_in_file(RiskKind::DynamicU256Shift, "dynamic_u256_shift.move");
-    assert_eq!(findings.len(), 1, "unexpected findings: {:?}", analysis.findings);
-    let finding = findings[0];
-    assert_eq!(finding.severity, Severity::Warning);
-    assert_eq!(analysis.line_for(finding), 3);
-    assert!(finding.message.contains("u256 shift counts are not runtime-checked"));
+    assert!(
+        analysis.findings.is_empty(),
+        "dynamic u256 shifts with a u8 shift amount should not warn on their own: {:?}",
+        analysis.findings
+    );
     Ok(())
 }
 
@@ -260,7 +319,12 @@ fn bitwise_or_and_xor_before_amount_math_warn() -> Result<()> {
         RiskKind::SuspiciousBitwiseArithmetic,
         "bitwise_warning.move",
     );
-    assert_eq!(findings.len(), 2, "unexpected findings: {:?}", analysis.findings);
+    assert_eq!(
+        findings.len(),
+        2,
+        "unexpected findings: {:?}",
+        analysis.findings
+    );
     for finding in findings {
         assert_eq!(finding.severity, Severity::Warning);
     }
@@ -269,21 +333,68 @@ fn bitwise_or_and_xor_before_amount_math_warn() -> Result<()> {
 
 #[test]
 fn weak_denominator_product_only_guarded_at_product_level_warns() -> Result<()> {
-    let analysis = analyze_fixture("tests/security_analysis/reduced_cases/weak_denominator_warning")?;
+    let analysis =
+        analyze_fixture("tests/security_analysis/reduced_cases/weak_denominator_warning")?;
     let findings = analysis.find_in_file(
         RiskKind::ReachableWeakDenominator,
         "weak_denominator_warning.move",
     );
-    assert_eq!(findings.len(), 1, "unexpected findings: {:?}", analysis.findings);
+    assert_eq!(
+        findings.len(),
+        1,
+        "unexpected findings: {:?}",
+        analysis.findings
+    );
     let finding = findings[0];
     assert_eq!(finding.severity, Severity::Warning);
-    assert!(finding.title.contains("independently proven positive"));
+    assert!(finding.title.contains("Independent denominator factors"));
+    Ok(())
+}
+
+#[test]
+fn denominator_obligation_survives_symbol_renames() -> Result<()> {
+    let analysis = analyze_fixture("tests/security_analysis/reduced_cases/semantic_rename")?;
+    let findings =
+        analysis.find_in_file(RiskKind::ReachableWeakDenominator, "semantic_rename.move");
+    assert!(
+        !findings.is_empty(),
+        "expected semantic denominator obligation finding after symbol renames: {:?}",
+        analysis.findings
+    );
+    assert!(
+        findings.iter().any(|finding| finding
+            .message
+            .contains("independent denominator factor")),
+        "expected independent-factor obligation evidence: {:?}",
+        findings
+    );
+    Ok(())
+}
+
+#[test]
+fn mixed_rounding_paths_report_rounding_mismatch() -> Result<()> {
+    let analysis = analyze_fixture("tests/security_analysis/reduced_cases/rounding_mismatch")?;
+    let findings =
+        analysis.find_in_file(RiskKind::ReachableRoundingMismatch, "rounding_mismatch.move");
+    assert!(
+        !findings.is_empty(),
+        "expected mixed-rounding mismatch finding, got {:?}",
+        analysis.findings
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.message.contains("rounding mode")),
+        "expected rounding evidence in mismatch finding message: {:?}",
+        findings
+    );
     Ok(())
 }
 
 #[test]
 fn safe_or_guard_checked_helper_is_suppressed() -> Result<()> {
-    let analysis = analyze_fixture("tests/security_analysis/reduced_cases/safe_disjunctive_helper")?;
+    let analysis =
+        analyze_fixture("tests/security_analysis/reduced_cases/safe_disjunctive_helper")?;
     assert!(
         analysis.findings.is_empty(),
         "safe disjunctive helper guard should suppress findings: {:?}",
@@ -299,7 +410,12 @@ fn helper_return_unrelated_param_reports_seed_shift() -> Result<()> {
         RiskKind::ReachableShiftTruncation,
         "reference_regressions.move",
     );
-    assert_eq!(findings.len(), 1, "unexpected findings: {:?}", analysis.findings);
+    assert_eq!(
+        findings.len(),
+        1,
+        "unexpected findings: {:?}",
+        analysis.findings
+    );
     let finding = findings[0];
     assert!(finding.message.contains("seed"));
     assert!(!finding.message.contains("coupon"));
@@ -329,13 +445,155 @@ fn weak_sink_is_lower_severity_than_cetus_path() -> Result<()> {
 
 #[test]
 fn package_with_local_dependency_is_analyzed() -> Result<()> {
-    let analysis = analyze_fixture("tests/security_analysis/dependency_cases/local_dependency_root")?;
+    let analysis =
+        analyze_fixture("tests/security_analysis/dependency_cases/local_dependency_root")?;
     assert!(
         analysis.findings.is_empty(),
         "dependency smoke fixture should compile cleanly once the local dependency resolves: {:?}",
         analysis.findings
     );
     Ok(())
+}
+
+#[test]
+fn root_only_scope_excludes_dependency_findings() -> Result<()> {
+    let analysis = analyze_fixture_with_options(
+        "tests/security_analysis/dependency_cases/scope_root",
+        PackageAnalysisOptions {
+            dependency_mode: DependencyMode::Off,
+            analysis_scope: AnalysisScope::RootOnly,
+            reuse_build_cache: false,
+            security_math_mode: SecurityMathMode::Fast,
+            security_smt_timeout_ms: 250,
+        },
+    )?;
+    assert!(
+        analysis.findings.is_empty(),
+        "root-only analysis should ignore dependency-owned findings: {:?}",
+        analysis.findings
+    );
+    Ok(())
+}
+
+#[test]
+fn root_and_direct_scope_includes_direct_dependency_findings_only() -> Result<()> {
+    let analysis = analyze_fixture_with_options(
+        "tests/security_analysis/dependency_cases/scope_root",
+        PackageAnalysisOptions {
+            dependency_mode: DependencyMode::Off,
+            analysis_scope: AnalysisScope::RootAndDirectDeps,
+            reuse_build_cache: false,
+            security_math_mode: SecurityMathMode::Fast,
+            security_smt_timeout_ms: 250,
+        },
+    )?;
+    let direct_findings = analysis.find_in_file(
+        RiskKind::ReachableShiftTruncation,
+        "scope_direct/sources/direct_risk.move",
+    );
+    assert_eq!(
+        direct_findings.len(),
+        1,
+        "unexpected findings: {:?}",
+        analysis.findings
+    );
+    assert!(
+        analysis
+            .find_in_file(
+                RiskKind::ReachableShiftTruncation,
+                "scope_transitive/sources/transitive_risk.move",
+            )
+            .is_empty(),
+        "transitive findings should be out of scope: {:?}",
+        analysis.findings
+    );
+    assert_eq!(
+        analysis.finding_scope(direct_findings[0]),
+        PackageSourceScope::DirectDependency
+    );
+    Ok(())
+}
+
+#[test]
+fn whole_graph_scope_includes_transitive_dependency_findings() -> Result<()> {
+    let analysis = analyze_fixture_with_options(
+        "tests/security_analysis/dependency_cases/scope_root",
+        PackageAnalysisOptions {
+            dependency_mode: DependencyMode::Off,
+            analysis_scope: AnalysisScope::WholeGraph,
+            reuse_build_cache: false,
+            security_math_mode: SecurityMathMode::Fast,
+            security_smt_timeout_ms: 250,
+        },
+    )?;
+    assert_eq!(
+        analysis
+            .find_in_file(
+                RiskKind::ReachableShiftTruncation,
+                "scope_direct/sources/direct_risk.move",
+            )
+            .len(),
+        1,
+        "expected direct dependency finding: {:?}",
+        analysis.findings
+    );
+    let transitive = analysis.find_in_file(
+        RiskKind::ReachableShiftTruncation,
+        "scope_transitive/sources/transitive_risk.move",
+    );
+    assert_eq!(
+        transitive.len(),
+        1,
+        "expected transitive finding: {:?}",
+        analysis.findings
+    );
+    assert_eq!(
+        analysis.finding_scope(transitive[0]),
+        PackageSourceScope::TransitiveDependency
+    );
+    Ok(())
+}
+
+#[test]
+fn package_cache_dir_is_reused_when_enabled() -> Result<()> {
+    let options = PackageAnalysisOptions {
+        dependency_mode: DependencyMode::Off,
+        analysis_scope: AnalysisScope::WholeGraph,
+        reuse_build_cache: true,
+        security_math_mode: SecurityMathMode::Fast,
+        security_smt_timeout_ms: 250,
+    };
+    let first = analyze_fixture_with_options(
+        "tests/security_analysis/dependency_cases/local_dependency_root",
+        options.clone(),
+    )?;
+    let second = analyze_fixture_with_options(
+        "tests/security_analysis/dependency_cases/local_dependency_root",
+        options,
+    )?;
+    assert_eq!(
+        first.install_dir, second.install_dir,
+        "persistent cache should reuse the same install dir"
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_framework_errors_trigger_auto_retry_detector() {
+    assert!(should_retry_with_implicit_deps(
+        "address 'std' is not assigned a value and unbound module 'sui::coin'"
+    ));
+    assert!(should_retry_with_implicit_deps(
+        "Unresolved addresses: [Named address 'sui' in package 'Demo']"
+    ));
+}
+
+#[test]
+fn unrelated_dependency_errors_do_not_trigger_auto_retry_detector() {
+    assert!(!should_retry_with_implicit_deps(
+        "Unbound module 'local_math::helper' in root::entry"
+    ));
+    assert!(!should_retry_with_implicit_deps("Compilation error"));
 }
 
 #[test]

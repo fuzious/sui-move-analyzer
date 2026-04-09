@@ -6,7 +6,11 @@ use move_compiler::{
 
 pub fn function_cfg(
     function: &G::Function,
-) -> Option<(H::Label, G::BasicBlocks, std::collections::BTreeMap<H::Label, G::BlockInfo>)> {
+) -> Option<(
+    H::Label,
+    G::BasicBlocks,
+    std::collections::BTreeMap<H::Label, G::BlockInfo>,
+)> {
     match &function.body.value {
         G::FunctionBody_::Defined {
             start,
@@ -20,8 +24,11 @@ pub fn function_cfg(
 
 pub fn build_cfg<'a>(
     function: &'a G::Function,
-) -> Option<(ImmForwardCFG<'a>, &'a G::BasicBlocks, &'a std::collections::BTreeMap<H::Label, G::BlockInfo>)>
-{
+) -> Option<(
+    ImmForwardCFG<'a>,
+    &'a G::BasicBlocks,
+    &'a std::collections::BTreeMap<H::Label, G::BlockInfo>,
+)> {
     match &function.body.value {
         G::FunctionBody_::Defined {
             start,

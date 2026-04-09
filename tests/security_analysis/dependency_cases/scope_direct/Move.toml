@@ -1,0 +1,10 @@
+[package]
+name = "ScopeDirect"
+version = "0.0.1"
+edition = "2024.beta"
+
+[dependencies]
+ScopeTransitive = { local = "../scope_transitive" }
+
+[addresses]
+scope_direct = "0x42"

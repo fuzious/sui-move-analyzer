@@ -1,12 +1,10 @@
-use move_compiler::{
-    hlir::ast as H,
-    naming::ast::BuiltinTypeName_,
-    parser::ast::BinOp_,
-};
+use move_compiler::{hlir::ast as H, naming::ast::BuiltinTypeName_, parser::ast::BinOp_};
 use move_core_types::u256::U256;
+use move_ir_types::location::Loc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    hash::{Hash, Hasher},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,9 +245,8 @@ impl BitFacts {
 
     pub fn bitxor(&self, other: &Self, width: u16) -> Self {
         let mask = width_mask(width);
-        let known_one = ((self.known_one & other.known_zero)
-            | (self.known_zero & other.known_one))
-            & mask;
+        let known_one =
+            ((self.known_one & other.known_zero) | (self.known_zero & other.known_one)) & mask;
         let known_zero = ((self.known_zero & other.known_zero)
             | (self.known_one & other.known_one))
             | (U256::max_value() ^ mask);
@@ -277,9 +274,9 @@ pub enum RiskKind {
     ReachableNarrowCast,
     InvalidShiftCount,
     ReachableLossyRightShift,
-    DynamicU256Shift,
     SuspiciousBitwiseArithmetic,
     ReachableWeakDenominator,
+    ReachableRoundingMismatch,
 }
 
 impl RiskKind {
@@ -290,11 +287,67 @@ impl RiskKind {
             Self::ReachableNarrowCast => "security/reachable-narrow-cast",
             Self::InvalidShiftCount => "security/invalid-shift-count",
             Self::ReachableLossyRightShift => "security/reachable-lossy-right-shift",
-            Self::DynamicU256Shift => "security/dynamic-u256-shift",
             Self::SuspiciousBitwiseArithmetic => "security/suspicious-bitwise-arithmetic",
             Self::ReachableWeakDenominator => "security/reachable-weak-denominator",
+            Self::ReachableRoundingMismatch => "security/reachable-rounding-mismatch",
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ObligationKind {
+    None,
+    NonZeroDivisor,
+    IndependentFactorPositivity,
+    RoundingConsistency,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProofMode {
+    Abstract,
+    Smt,
+    Heuristic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RoundingMode {
+    Exact,
+    RoundDown,
+    RoundUp,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SemanticRole {
+    DivLhs,
+    DivRhs,
+    MulFactor,
+    Pow2Scale,
+    Difference,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExprOp {
+    Const,
+    Var,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Shl,
+    Shr,
+    Cast,
+    CallResult,
+    Opaque,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExprNode {
+    pub id: u64,
+    pub op: ExprOp,
+    pub children: Vec<u64>,
+    pub debug: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -311,22 +364,36 @@ pub enum FormulaTag {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormulaFactor {
+    pub id: u64,
     pub name: String,
     pub tags: BTreeSet<FormulaTag>,
+    pub roles: BTreeSet<SemanticRole>,
     pub strict_positive: bool,
+    pub source_locs: Vec<Loc>,
+    pub proof_mode: ProofMode,
 }
 
 impl FormulaFactor {
-    pub fn new(name: String, tags: BTreeSet<FormulaTag>, strict_positive: bool) -> Self {
+    pub fn new(
+        id: u64,
+        name: String,
+        tags: BTreeSet<FormulaTag>,
+        strict_positive: bool,
+        proof_mode: ProofMode,
+    ) -> Self {
         Self {
+            id,
             name,
             tags,
+            roles: BTreeSet::new(),
             strict_positive,
+            source_locs: vec![],
+            proof_mode,
         }
     }
 
     pub fn join(&self, other: &Self) -> Option<Self> {
-        if self.name != other.name {
+        if self.id != other.id {
             return None;
         }
         let tags = self
@@ -334,10 +401,29 @@ impl FormulaFactor {
             .intersection(&other.tags)
             .cloned()
             .collect::<BTreeSet<_>>();
+        let roles = self
+            .roles
+            .intersection(&other.roles)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut source_locs = self.source_locs.clone();
+        for loc in &other.source_locs {
+            if !source_locs.contains(loc) {
+                source_locs.push(*loc);
+            }
+        }
         Some(Self {
+            id: self.id,
             name: self.name.clone(),
             tags,
+            roles,
             strict_positive: self.strict_positive && other.strict_positive,
+            source_locs,
+            proof_mode: if self.proof_mode == other.proof_mode {
+                self.proof_mode.clone()
+            } else {
+                ProofMode::Heuristic
+            },
         })
     }
 }
@@ -346,6 +432,11 @@ impl FormulaFactor {
 pub struct FormulaFacts {
     pub tags: BTreeSet<FormulaTag>,
     pub factors: Vec<FormulaFactor>,
+    pub root_expr: Option<ExprNode>,
+    pub roles: BTreeSet<SemanticRole>,
+    pub rounding_mode: RoundingMode,
+    pub rounding_trace: Vec<String>,
+    pub rounding_conflict: bool,
 }
 
 impl FormulaFacts {
@@ -354,9 +445,26 @@ impl FormulaFacts {
         if tags.is_empty() {
             return None;
         }
+        let id = stable_hash(&[name.as_bytes()]);
         Some(Self {
             tags: tags.clone(),
-            factors: vec![FormulaFactor::new(name.to_string(), tags, strict_positive)],
+            factors: vec![FormulaFactor::new(
+                id,
+                name.to_string(),
+                tags,
+                strict_positive,
+                ProofMode::Heuristic,
+            )],
+            root_expr: Some(ExprNode {
+                id,
+                op: ExprOp::Var,
+                children: vec![],
+                debug: name.to_string(),
+            }),
+            roles: BTreeSet::new(),
+            rounding_mode: RoundingMode::Exact,
+            rounding_trace: vec![],
+            rounding_conflict: false,
         })
     }
 
@@ -371,16 +479,55 @@ impl FormulaFacts {
             if let Some(other_factor) = other
                 .factors
                 .iter()
-                .find(|candidate| candidate.name == factor.name)
+                .find(|candidate| candidate.id == factor.id)
                 && let Some(joined) = factor.join(other_factor)
             {
                 factors.push(joined);
             }
         }
+        let roles = self
+            .roles
+            .intersection(&other.roles)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let semantically_related = self.semantically_related_to(other);
+        let rounding_conflict = self.rounding_conflict
+            || other.rounding_conflict
+            || (semantically_related
+                && ((self.rounding_mode == RoundingMode::RoundUp
+                    && other.rounding_mode == RoundingMode::RoundDown)
+                    || (self.rounding_mode == RoundingMode::RoundDown
+                        && other.rounding_mode == RoundingMode::RoundUp)));
+        let rounding_mode = if rounding_conflict {
+            RoundingMode::Unknown
+        } else if self.rounding_mode == other.rounding_mode {
+            self.rounding_mode
+        } else {
+            RoundingMode::Unknown
+        };
+        let mut rounding_trace = self.rounding_trace.clone();
+        for trace in &other.rounding_trace {
+            if !rounding_trace.contains(trace) {
+                rounding_trace.push(trace.clone());
+            }
+        }
+        let root_expr = if self.root_expr == other.root_expr {
+            self.root_expr.clone()
+        } else {
+            None
+        };
         if tags.is_empty() && factors.is_empty() {
             None
         } else {
-            Some(Self { tags, factors })
+            Some(Self {
+                tags,
+                factors,
+                root_expr,
+                roles,
+                rounding_mode,
+                rounding_trace,
+                rounding_conflict,
+            })
         }
     }
 
@@ -393,6 +540,27 @@ impl FormulaFacts {
         for tag in tags {
             self.tags.insert(tag);
         }
+    }
+
+    pub fn add_role(&mut self, role: SemanticRole) {
+        self.roles.insert(role.clone());
+        for factor in &mut self.factors {
+            factor.roles.insert(role.clone());
+        }
+    }
+
+    pub fn semantically_related_to(&self, other: &Self) -> bool {
+        if self
+            .root_expr
+            .as_ref()
+            .zip(other.root_expr.as_ref())
+            .is_some_and(|(lhs, rhs)| lhs.id == rhs.id)
+        {
+            return true;
+        }
+        self.factors
+            .iter()
+            .any(|lhs| other.factors.iter().any(|rhs| lhs.id == rhs.id))
     }
 
     pub fn all_factors_strict_positive(&self) -> bool {
@@ -424,6 +592,9 @@ pub struct RiskOrigin {
     pub helper_name: Option<String>,
     pub helper_like: bool,
     pub guard_mismatch: bool,
+    pub obligation_kind: ObligationKind,
+    pub proof_mode: ProofMode,
+    pub rounding_mode: Option<RoundingMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -478,11 +649,25 @@ impl ValueState {
 
     pub fn exact_uint(width: u16, value: U256) -> Self {
         let facts = BitFacts::exact(width, value);
+        let expr_id = stable_hash(&[b"const", value.to_string().as_bytes()]);
         Self {
             interval: Interval::singleton(value & width_mask(width)),
             term: SymbolicTerm::Const(value & width_mask(width)),
             bit_facts: Some(facts),
-            formula_facts: None,
+            formula_facts: Some(FormulaFacts {
+                tags: BTreeSet::new(),
+                factors: vec![],
+                root_expr: Some(ExprNode {
+                    id: expr_id,
+                    op: ExprOp::Const,
+                    children: vec![],
+                    debug: value.to_string(),
+                }),
+                roles: BTreeSet::new(),
+                rounding_mode: RoundingMode::Exact,
+                rounding_trace: vec![],
+                rounding_conflict: false,
+            }),
             parameter_dependencies: BTreeSet::new(),
             risky_origins: vec![],
         }
@@ -516,13 +701,16 @@ impl ValueState {
     }
 
     pub fn width(&self) -> Option<u16> {
-        self.bit_facts.as_ref().map(|facts| facts.width).or_else(|| {
-            self.interval.upper.and_then(|upper| {
-                [8u16, 16, 32, 64, 128, 256]
-                    .into_iter()
-                    .find(|width| upper <= uint_max(*width))
+        self.bit_facts
+            .as_ref()
+            .map(|facts| facts.width)
+            .or_else(|| {
+                self.interval.upper.and_then(|upper| {
+                    [8u16, 16, 32, 64, 128, 256]
+                        .into_iter()
+                        .find(|width| upper <= uint_max(*width))
+                })
             })
-        })
     }
 
     pub fn exact_value(&self) -> Option<U256> {
@@ -702,6 +890,14 @@ pub fn low_mask(shift: u8) -> U256 {
     } else {
         (U256::one() << shift) - U256::one()
     }
+}
+
+pub fn stable_hash(parts: &[&[u8]]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 pub fn formula_tags_from_name(name: &str) -> BTreeSet<FormulaTag> {

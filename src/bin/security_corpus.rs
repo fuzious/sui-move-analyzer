@@ -5,11 +5,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
-use sui_move_analyzer::{implicit_deps, security_analysis::analyze_package};
+use sui_move_analyzer::security_analysis::{
+    AnalysisScope, DependencyMode, PackageAnalysisOptions, SecurityMathMode,
+    analyze_package_with_options,
+};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Run the security analyzer against a pinned external corpus")]
+#[command(
+    author,
+    version,
+    about = "Run the security analyzer against a pinned external corpus"
+)]
 struct Options {
     #[arg(long)]
     manifest: PathBuf,
@@ -35,8 +45,37 @@ struct CorpusPackage {
     git: String,
     rev: String,
     package_subdir: String,
-    with_implicit_deps: Option<bool>,
+    dependency_mode: Option<ManifestDependencyMode>,
+    scope: Option<ManifestAnalysisScope>,
+    security_math_mode: Option<ManifestMathMode>,
+    security_smt_timeout_ms: Option<u64>,
+    timeout_seconds: Option<u64>,
     expected: String,
+    must_include_rules: Option<Vec<String>>,
+    must_exclude_rules: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ManifestDependencyMode {
+    Off,
+    Auto,
+    Forced,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ManifestAnalysisScope {
+    Root,
+    Direct,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ManifestMathMode {
+    Fast,
+    Deep,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,8 +86,11 @@ struct CorpusResult {
     package_subdir: String,
     expected: String,
     actual: String,
+    expectation: String,
     finding_count: usize,
     rule_ids: Vec<String>,
+    missing_rules: Vec<String>,
+    unexpected_rules: Vec<String>,
     error: Option<String>,
 }
 
@@ -68,7 +110,13 @@ fn main() -> anyhow::Result<()> {
             short_rev(&package.rev),
             package.package_subdir
         );
+        let started = Instant::now();
         results.push(run_package(&cache_root, &package));
+        eprintln!(
+            "[security_corpus] finished {} in {:.2?}",
+            package.label,
+            started.elapsed()
+        );
     }
 
     match options.format {
@@ -76,13 +124,14 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
         OutputFormat::Table => {
-            println!("label | expected | actual | findings | rules | revision");
+            println!("label | expected | actual | expectation | findings | rules | revision");
             for result in &results {
                 println!(
-                    "{} | {} | {} | {} | {} | {}",
+                    "{} | {} | {} | {} | {} | {} | {}",
                     result.label,
                     result.expected,
                     result.actual,
+                    result.expectation,
                     result.finding_count,
                     if result.rule_ids.is_empty() {
                         "-".to_string()
@@ -91,6 +140,12 @@ fn main() -> anyhow::Result<()> {
                     },
                     short_rev(&result.rev)
                 );
+                if !result.missing_rules.is_empty() {
+                    println!("  missing rules: {}", result.missing_rules.join(","));
+                }
+                if !result.unexpected_rules.is_empty() {
+                    println!("  unexpected rules: {}", result.unexpected_rules.join(","));
+                }
                 if let Some(error) = &result.error {
                     println!("  error: {error}");
                 }
@@ -111,8 +166,11 @@ fn run_package(cache_root: &Path, package: &CorpusPackage) -> CorpusResult {
         package_subdir: package.package_subdir.clone(),
         expected: package.expected.clone(),
         actual: "manual-review".to_string(),
+        expectation: "manual-review".to_string(),
         finding_count: 0,
         rule_ids: vec![],
+        missing_rules: vec![],
+        unexpected_rules: vec![],
         error: None,
     };
 
@@ -121,24 +179,63 @@ fn run_package(cache_root: &Path, package: &CorpusPackage) -> CorpusResult {
         return result;
     }
 
-    let deps = if package.with_implicit_deps.unwrap_or(false) {
-        implicit_deps()
-    } else {
-        Default::default()
+    let analysis_options = PackageAnalysisOptions {
+        dependency_mode: match package
+            .dependency_mode
+            .unwrap_or(ManifestDependencyMode::Auto)
+        {
+            ManifestDependencyMode::Off => DependencyMode::Off,
+            ManifestDependencyMode::Auto => DependencyMode::Auto,
+            ManifestDependencyMode::Forced => DependencyMode::Forced,
+        },
+        analysis_scope: match package.scope.unwrap_or(ManifestAnalysisScope::Direct) {
+            ManifestAnalysisScope::Root => AnalysisScope::RootOnly,
+            ManifestAnalysisScope::Direct => AnalysisScope::RootAndDirectDeps,
+            ManifestAnalysisScope::All => AnalysisScope::WholeGraph,
+        },
+        reuse_build_cache: true,
+        security_math_mode: match package.security_math_mode.unwrap_or(ManifestMathMode::Fast) {
+            ManifestMathMode::Fast => SecurityMathMode::Fast,
+            ManifestMathMode::Deep => SecurityMathMode::Deep,
+        },
+        security_smt_timeout_ms: package.security_smt_timeout_ms.unwrap_or(250),
     };
-
-    match analyze_package(&package_path, deps) {
+    match analyze_with_timeout(
+        package_path.clone(),
+        analysis_options,
+        package.timeout_seconds,
+    ) {
         Ok(analysis) => {
-            let mut rules = BTreeSet::new();
-            for finding in &analysis.findings {
-                rules.insert(finding.kind.rule_id().to_string());
-            }
-            result.finding_count = analysis.findings.len();
-            result.rule_ids = rules.into_iter().collect();
-            result.actual = if analysis.findings.is_empty() {
-                "clean".to_string()
+            result.finding_count = analysis.finding_count;
+            result.rule_ids = analysis.rule_ids;
+            result.actual = analysis.actual;
+            let actual_rules = result.rule_ids.iter().cloned().collect::<BTreeSet<_>>();
+            let mut missing_rules = package
+                .must_include_rules
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|rule| !actual_rules.contains(rule))
+                .collect::<Vec<_>>();
+            missing_rules.sort();
+            let mut unexpected_rules = package
+                .must_exclude_rules
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|rule| actual_rules.contains(rule))
+                .collect::<Vec<_>>();
+            unexpected_rules.sort();
+            let status_matches = package.expected == result.actual;
+            result.missing_rules = missing_rules;
+            result.unexpected_rules = unexpected_rules;
+            result.expectation = if status_matches
+                && result.missing_rules.is_empty()
+                && result.unexpected_rules.is_empty()
+            {
+                "matched".to_string()
             } else {
-                "flagged".to_string()
+                "mismatch".to_string()
             };
         }
         Err(error) => {
@@ -149,9 +246,73 @@ fn run_package(cache_root: &Path, package: &CorpusPackage) -> CorpusResult {
     result
 }
 
+#[derive(Debug)]
+struct CorpusSummary {
+    actual: String,
+    finding_count: usize,
+    rule_ids: Vec<String>,
+}
+
+fn analyze_with_timeout(
+    package_path: PathBuf,
+    options: PackageAnalysisOptions,
+    timeout_seconds: Option<u64>,
+) -> anyhow::Result<CorpusSummary> {
+    if let Some(timeout_seconds) = timeout_seconds {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let summary = analyze_package_with_options(&package_path, options).map(|analysis| {
+                let mut rules = BTreeSet::new();
+                for finding in &analysis.findings {
+                    rules.insert(finding.kind.rule_id().to_string());
+                }
+                CorpusSummary {
+                    actual: if analysis.findings.is_empty() {
+                        "clean".to_string()
+                    } else {
+                        "flagged".to_string()
+                    },
+                    finding_count: analysis.findings.len(),
+                    rule_ids: rules.into_iter().collect(),
+                }
+            });
+            let _ = sender.send(summary);
+        });
+        return match receiver.recv_timeout(Duration::from_secs(timeout_seconds)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(CorpusSummary {
+                actual: "manual-review".to_string(),
+                finding_count: 0,
+                rule_ids: vec![],
+            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("analysis worker disconnected before returning a result")
+            }
+        };
+    }
+
+    let analysis = analyze_package_with_options(&package_path, options)?;
+    let mut rules = BTreeSet::new();
+    for finding in &analysis.findings {
+        rules.insert(finding.kind.rule_id().to_string());
+    }
+    Ok(CorpusSummary {
+        actual: if analysis.findings.is_empty() {
+            "clean".to_string()
+        } else {
+            "flagged".to_string()
+        },
+        finding_count: analysis.findings.len(),
+        rule_ids: rules.into_iter().collect(),
+    })
+}
+
 fn checkout_repo(repo_dir: &Path, git: &str, rev: &str) -> anyhow::Result<()> {
     if !repo_dir.exists() {
-        run_git(None, &["clone", "--no-checkout", git, repo_dir.to_str().unwrap()])?;
+        run_git(
+            None,
+            &["clone", "--no-checkout", git, repo_dir.to_str().unwrap()],
+        )?;
     }
     run_git(Some(repo_dir), &["fetch", "--depth", "1", "origin", rev])?;
     run_git(Some(repo_dir), &["checkout", "--force", rev])?;
@@ -179,7 +340,13 @@ fn run_git(cwd: Option<&Path>, args: &[&str]) -> anyhow::Result<()> {
 fn sanitize_label(label: &str) -> String {
     label
         .chars()
-        .map(|char| if char.is_ascii_alphanumeric() { char } else { '_' })
+        .map(|char| {
+            if char.is_ascii_alphanumeric() {
+                char
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
