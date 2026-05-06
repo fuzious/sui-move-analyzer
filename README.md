@@ -1,9 +1,6 @@
 # sui-move-analyzer
 
-> **Assignment submission note**  
-> I wrote the security analysis section below for the take-home assignment. If you want to reproduce the results, go straight to [Verification](#verification).
 
----
 
 ## What I built
 
