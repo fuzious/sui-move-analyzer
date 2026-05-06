@@ -1,0 +1,43 @@
+[[packages]]
+label = "integer-mate-vulnerable"
+git = "https://github.com/CetusProtocol/integer-mate.git"
+rev = "8176959496e5fb11c033537cc1b8bfb2af2ad9fb"
+package_subdir = "sui"
+dependency_mode = "off"
+scope = "root"
+timeout_seconds = 180
+expected = "flagged"
+must_include_rules = ["security/fake-checked-shift"]
+
+[[packages]]
+label = "integer-mate-partial-fix"
+git = "https://github.com/CetusProtocol/integer-mate.git"
+rev = "ffb2292d47e99e5b53fb63a044e48f4876c0ea8d"
+package_subdir = "sui"
+dependency_mode = "off"
+scope = "root"
+timeout_seconds = 180
+expected = "flagged"
+must_include_rules = ["security/fake-checked-shift"]
+
+[[packages]]
+label = "integer-mate-fixed"
+git = "https://github.com/CetusProtocol/integer-mate.git"
+rev = "970667ab282d24d3ca30e1aac989b61864b95ce6"
+package_subdir = "sui"
+dependency_mode = "off"
+scope = "root"
+timeout_seconds = 180
+expected = "flagged"
+must_exclude_rules = ["security/fake-checked-shift"]
+
+[[packages]]
+label = "cetus-clmm"
+git = "https://github.com/CetusProtocol/cetus-clmm-interface.git"
+rev = "74e98b69334ecc84fc419d10a59d3d4e1f832d32"
+package_subdir = "sui/cetus_clmm"
+dependency_mode = "auto"
+scope = "direct"
+timeout_seconds = 180
+expected = "flagged"
+must_include_rules = ["security/reachable-weak-denominator"]

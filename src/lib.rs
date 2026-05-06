@@ -49,6 +49,7 @@ pub mod project_context;
 pub mod project_visitor;
 pub mod references;
 pub mod scope;
+pub mod security_analysis;
 pub mod snap_cache;
 pub mod struct_dep_graph;
 pub mod sui_move_analyzer;

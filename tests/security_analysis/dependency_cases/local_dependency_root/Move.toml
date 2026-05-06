@@ -1,0 +1,10 @@
+[package]
+name = "DependencyRoot"
+version = "0.0.1"
+edition = "2024.beta"
+
+[dependencies]
+LocalMath = { local = "../local_dependency_lib" }
+
+[addresses]
+root = "0x42"

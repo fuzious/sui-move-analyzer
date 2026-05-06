@@ -1,0 +1,10 @@
+[package]
+name = "ClmmDenominatorPatched"
+version = "0.0.1"
+edition = "2024.beta"
+
+[dependencies]
+
+[addresses]
+cetus_clmm = "0x42"
+integer_mate = "0x43"

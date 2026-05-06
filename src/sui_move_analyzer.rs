@@ -21,7 +21,7 @@ use move_compiler::{
 };
 use move_package::source_package::parsed_manifest::Dependencies;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -506,7 +506,7 @@ pub fn on_notification(
 fn get_package_compile_diagnostics(
     ide_files_root: VfsPath,
     file_path: &Path,
-    file_to_diag: bool,
+    _file_to_diag: bool,
     implicit_deps: Dependencies,
 ) -> Result<move_compiler::diagnostics::Diagnostics> {
     use anyhow::*;
@@ -539,13 +539,8 @@ fn get_package_compile_diagnostics(
     let mut diagnostics = None;
     build_plan.compile_with_driver_and_deps(dependencies, &mut std::io::sink(), |compiler| {
         let compiler = compiler.set_ide_mode();
-        let (files, compilation_result) = compiler
-            .set_files_to_compile(if file_to_diag {
-                Some(BTreeSet::from([file_path.to_path_buf()]))
-            } else {
-                None
-            })
-            .run::<PASS_PARSER>()?;
+        let (files, compilation_result) =
+            compiler.set_files_to_compile(None).run::<PASS_PARSER>()?;
 
         let compiler = match compilation_result {
             std::result::Result::Ok(v) => v,
@@ -585,8 +580,13 @@ fn get_package_compile_diagnostics(
                 return Ok((files, vec![]));
             }
         };
+        let (compiler, cfgir_program) = compiler.into_ast();
+        let mut final_diags = compiler.compilation_env().take_final_diags();
+        final_diags.extend(crate::security_analysis::analyze_cfgir_program(
+            &cfgir_program,
+        ));
         let failure = false;
-        diagnostics = Some((compiler.compilation_env().take_final_diags(), failure));
+        diagnostics = Some((final_diags, failure));
         eprintln!("compiled to CFGIR");
         Ok((files, Default::default()))
     })?;

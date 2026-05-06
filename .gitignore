@@ -2,3 +2,6 @@ target/
 *.lock
 *build/
 tmp/
+reference
+docs
+demo

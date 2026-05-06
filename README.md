@@ -1,33 +1,70 @@
 # sui-move-analyzer
-**Table of Contents**
-* [Introduction](#Introduction)
-* [Features](#Features)
-* [Support](#Support)
 
-## Introduction <span id="Introduction">
-The **sui-move-analyzer** is a Visual Studio Code plugin for **Sui Move** language developed by [MoveBit](https://movebit.xyz). Although this is an alpha release, it has many useful features, such as **highlight, autocomplete, go to definition/references**, and so on.
 
-## Features <span id="Features">
 
-Here are some of the features of the sui-move-analyzer Visual Studio Code extension. To see them, open a
-Move source file (a file with a `.move` file extension) and:
+## What I built
 
-- See Move keywords and types highlighted in appropriate colors.
-- As you type, Move keywords will appear as completion suggestions.
-- If the opened Move source file is located within a buildable project (a `Move.toml` file can be
-  found in one of its parent directories), the following advanced features will also be available:
-  - compiler diagnostics
-  - sui commands line tool(you need install Sui Client CLI locally)
-  - sui project template
-  - go to definition
-  - go to references
-  - type on hover
-  - inlay hints
-  - linter for move file
-  - ...
+![Architecture](achitecture_bitwise.png)
 
-## Support <span id="Support">
+Move's compiler and runtime already catch a lot of arithmetic bugs. If `a + b` overflows, it aborts. If `a / 0` happens, it aborts. If a narrowing cast does not fit, it aborts. Existing static analyzers go further and flag things like precision loss, rounding errors, and weak divisors in arithmetic code.
 
-1.If you find any issues, please report a GitHub issue to the [issue](https://github.com/movebit/sui-move-analyzer/issues) repository to get help.
+In DeFi code, especially in CLMM and fixed-point math, developers often use bitwise operations like arithmetic because they are faster. For example:
 
-2.Welcome to the developer discussion group as well: [MoveAnalyzer](https://t.me/moveanalyzer). 
+- `x << 64` means `x * 2^64`
+- `x >> 64` means `x / 2^64`
+- `x & 0xFFFF` is often used to keep a value in range
+
+The `integer-mate` library used by Cetus does this a lot. So do many concentrated liquidity AMMs, lending rate calculators, and oracle scaling implementations on Sui. The problem is that the compiler and existing analyzers usually treat these as plain bit manipulation. They do not apply overflow or precision checks to them.
+
+I built a post-CFGIR security pass to close that gap. It applies the same kind of reasoning people already use for arithmetic, but on bitwise equivalents instead. The Cetus exploit is one example of this bug family. It is not the only one.
+
+I added lightweight SMT-style discharge helpers (`smt.rs`) for path/obligation checks (for example shift-safety and product-positivity proofs) to reduce false positives without changing the core static-analysis pipeline.
+
+### Signals
+
+| Signal | Rule ID | Runtime | Existing static tools | This pass |
+|---|---|---|---|---|
+| Shift truncation | `security/reachable-shift-truncation` | silent | silent | catches it |
+| Fake checked shift | `security/fake-checked-shift` | silent | silent | catches it |
+| Lossy right shift | `security/reachable-lossy-right-shift` | silent | silent | catches it |
+| Suspicious bitwise arithmetic | `security/suspicious-bitwise-arithmetic` | silent | silent | catches it |
+| Rounding mismatch | `security/reachable-rounding-mismatch` | silent | silent | catches it |
+| Invalid shift count | `security/invalid-shift-count` | aborts for `u8` to `u128`, silent on `u256` | missed | catches both, and the `u256` case has no other defense |
+| Narrowing cast after shift | `security/reachable-narrow-cast` | aborts at runtime | misses bitwise paths | catches it statically on shift and bitwise paths |
+| Weak denominator (product) | `security/reachable-weak-denominator` | aborts only if the denominator is exactly zero | flags simple zero denominators | catches product denominators where `assert!(product > 0)` exists but each factor is not independently proven to be greater than zero |
+
+---
+
+## Verification
+
+Prerequisites: `git`, Rust toolchain (`cargo`). The script also requires the `sui` CLI to pre-fetch Sui framework dependencies for the real Cetus package; the vendored commands below do not.
+
+**Exploit-family replay (integer-mate revisions):**
+
+```
+bash scripts/demo_cetus_exploit_family.sh
+```
+
+Clones `integer-mate` and checks three pinned revisions (vulnerable -> partial fix -> fully fixed). The script now enforces exploit-specific assertions: vulnerable and partial revisions must contain `security/fake-checked-shift` in `math_u256.move`, while the fixed revision must be clean.
+
+**Real Cetus package check (requires `sui` CLI):**
+
+```
+bash scripts/verify_cetus_real_package.sh
+```
+
+Builds and analyzes Cetus CLMM (commit `74e98b6`) with dependency resolution enabled.
+
+**Without the `sui` CLI (vendored fixtures, no network needed):**
+
+```
+cargo test --lib security_analysis
+```
+
+31 tests, all vendored. Each test name maps to a specific claim and includes enforced negative cases (patched versions must produce zero findings for their specific rule).
+
+```
+cargo run --bin security_demo -- tests/security_analysis/real_cases/cetus_vulnerable
+```
+
+Expected output includes `math_u256.move | 7 | ... | NonblockingError | security/fake-checked-shift` — the exact helper, line, and rule that caused the $223M loss.

@@ -1,0 +1,9 @@
+[package]
+name = "MissingLocalDependencyRoot"
+version = "0.0.1"
+edition = "2024.beta"
+
+[dependencies]
+
+[addresses]
+root = "0x42"
